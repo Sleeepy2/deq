@@ -149,7 +149,7 @@ In edit mode, scroll down to the Theme section to customize the look:
 | Setting | Description |
 |---------|-------------|
 | **Colors** | Background, cards, borders, text, accent color |
-| **Glass** | Transparency effect for cards (0-100%) |
+| **Transparency** | Transparency effect for cards (0-100%) |
 | **Blur** | Background blur amount (0-30px) |
 | **Wallpaper** | Background image URL (https://...) |
 
