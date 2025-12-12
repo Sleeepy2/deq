@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-DeQ - Homelab Dashboard
-Control devices, view stats, manage links - all in one place.
+DeQ - Homelab Admin Dashboard
+Control devices, view stats, manage links and files - all in one place.
+USE BEHIND VPN ONLY! DO NOT EXPOSE TO PUBLIC INTERNET!
+
 """
 
 import subprocess
@@ -11,6 +13,7 @@ import socket
 import time
 import threading
 import argparse
+import re
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -19,7 +22,7 @@ DEFAULT_PORT = 5050
 DATA_DIR = "/opt/deq"
 CONFIG_FILE = f"{DATA_DIR}/config.json"
 HISTORY_DIR = f"{DATA_DIR}/history"
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 
 # === DEFAULT CONFIG ===
 DEFAULT_HOST_DEVICE = {
@@ -713,7 +716,113 @@ def send_wol(mac, broadcast="255.255.255.255"):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+def is_valid_container_name(name):
+    """Validate docker container name to prevent shell injection."""
+    if not name or len(name) > 128:
+        return False
+    return bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]*$', name))
+
+def remote_docker_action(ip, user, port, container, action, use_sudo=False):
+    """Execute docker command on remote host via SSH."""
+    if not is_valid_container_name(container):
+        return {"success": False, "error": "Invalid container name"}
+
+    docker_cmd = "sudo docker" if use_sudo else "docker"
+
+    if action == "status":
+        ssh_cmd = f"{docker_cmd} inspect -f '{{{{.State.Status}}}}' '{container}'"
+    elif action in ("start", "stop"):
+        ssh_cmd = f"{docker_cmd} {action} '{container}'"
+    else:
+        return {"success": False, "error": "Unknown action"}
+
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+             "-p", str(port), f"{user}@{ip}", f'bash -lc "{ssh_cmd}"'],
+            capture_output=True, text=True, timeout=60
+        )
+
+        output = (result.stdout + result.stderr).lower()
+
+        if "permission denied" in output:
+            if not use_sudo:
+                return remote_docker_action(ip, user, port, container, action, use_sudo=True)
+            return {"success": False, "error": "Docker permission denied"}
+
+        if result.returncode == 0:
+            if action == "status":
+                status = result.stdout.strip()
+                return {"success": True, "status": status, "running": status == "running"}
+            return {"success": True}
+
+        if action == "status":
+            return {"success": False, "error": "Container not found"}
+        return {"success": False, "error": result.stderr.strip()[:100] if result.stderr else f"docker {action} failed"}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "SSH timeout"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def scan_docker_containers(device):
+    """Scan for docker containers on device (local or remote)."""
+    is_host = device.get('is_host', False)
+
+    if is_host:
+        try:
+            result = subprocess.run(
+                ["docker", "ps", "-a", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                return {"success": False, "error": "Docker not available"}
+            names = [n.strip() for n in result.stdout.strip().split('\n') if n.strip()]
+            return {"success": True, "containers": names}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    else:
+        ssh_config = device.get('ssh', {})
+        user = ssh_config.get('user')
+        port = ssh_config.get('port', 22)
+        ip = device.get('ip')
+
+        if not user:
+            return {"success": False, "error": "SSH not configured. Add SSH user to scan for containers."}
+
+        def try_scan(use_sudo=False):
+            docker_cmd = "sudo docker" if use_sudo else "docker"
+            ssh_cmd = f'{docker_cmd} ps -a --format "{{{{.Names}}}}"'
+            result = subprocess.run(
+                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                 "-p", str(port), f"{user}@{ip}", f'bash -lc "{ssh_cmd}"'],
+                capture_output=True, text=True, timeout=15
+            )
+            return result, use_sudo
+
+        try:
+            result, used_sudo = try_scan(False)
+            output = (result.stdout + result.stderr).lower()
+            if result.returncode != 0 or "permission denied" in output:
+                if not used_sudo:
+                    result, used_sudo = try_scan(True)
+                    output = (result.stdout + result.stderr).lower()
+
+            if result.returncode != 0:
+                error = result.stderr.strip() if result.stderr else "Docker not available"
+                return {"success": False, "error": error}
+            if "permission denied" in output:
+                return {"success": False, "error": "Docker permission denied. Add user to docker group or configure passwordless sudo."}
+            names = [n.strip() for n in result.stdout.strip().split('\n') if n.strip()]
+            return {"success": True, "containers": names}
+        except subprocess.TimeoutExpired:
+            return {"success": False, "error": "SSH timeout"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
 def docker_action(container, action):
+    if not is_valid_container_name(container):
+        return {"success": False, "error": "Invalid container name"}
     try:
         if action == "status":
             result = subprocess.run(
@@ -780,12 +889,12 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
         
         :root {
-            --bg-primary: #0a0a0f;
-            --bg-secondary: #12121a;
-            --bg-tertiary: #1a1a24;
-            --border: #2a2a3a;
+            --bg-primary: #161616;
+            --bg-secondary: #151515;
+            --bg-tertiary: #1a1a1a;
+            --border: #2b2b2b;
             --text-primary: #e0e0e0;
-            --text-secondary: #808090;
+            --text-secondary: #8a8a8a;
             --accent: #2ed573;
             --accent-muted: rgba(46, 213, 115, 0.6);
             --danger: #ff4757;
@@ -2527,35 +2636,35 @@ HTML_PAGE = '''<!DOCTYPE html>
         <header class="header">
             <a href="https://deq.rocks" target="_blank" rel="noopener" class="logo"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <rect class="icon-bg" width="512" height="512" rx="96"/>
-  <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="currentColor" stroke-width="8"/>
-  <path d="M430 155 L432 100 Q432 80 412 80 L302 80 Q282 80 282 100 L282 210 Q282 230 302 230 L430 230" fill="none" stroke="currentColor" stroke-width="8" stroke-linecap="round"/>
-  <line x1="400" y1="155" x2="428" y2="155" stroke="currentColor" stroke-width="8" stroke-linecap="round"/>
-  <path class="icon-accent" d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke-width="8" stroke-linecap="round"/>
-  <line class="icon-accent" x1="405" y1="405" x2="435" y2="435" stroke-width="8" stroke-linecap="round"/>
+  <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="currentColor" stroke-width="16"/>
+  <path d="M430 155 L432 100 Q432 80 412 80 L302 80 Q282 80 282 100 L282 210 Q282 230 302 230 L430 230" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+  <line x1="400" y1="155" x2="428" y2="155" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+  <path class="icon-accent" d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke-width="16" stroke-linecap="round"/>
+  <line class="icon-accent" x1="405" y1="405" x2="435" y2="435" stroke-width="16" stroke-linecap="round"/>
 </svg></a>
             <div class="header-actions">
                 <button class="icon-btn" id="files-btn" title="File Manager" onclick="openFileManager()">
                     <svg viewBox="0 0 512 512" fill="none">
                         <rect class="icon-bg" width="512" height="512" rx="96"/>
-                        <path d="M60 80 L190 80 Q210 80 210 100 L210 412 Q210 432 190 432 L60 432 Z" stroke="currentColor" stroke-width="8"/>
-                        <line x1="85" y1="140" x2="185" y2="140" stroke="currentColor" stroke-width="6" stroke-linecap="round"/>
-                        <line x1="85" y1="190" x2="160" y2="190" stroke="currentColor" stroke-width="6" stroke-linecap="round"/>
-                        <line x1="85" y1="240" x2="175" y2="240" stroke="currentColor" stroke-width="6" stroke-linecap="round"/>
-                        <path class="icon-accent" d="M302 80 L432 80 Q452 80 452 100 L452 412 Q452 432 432 432 L302 432 Z" fill="none" stroke-width="8"/>
-                        <line class="icon-accent" x1="327" y1="140" x2="427" y2="140" stroke-width="6" stroke-linecap="round"/>
-                        <line class="icon-accent" x1="327" y1="190" x2="390" y2="190" stroke-width="6" stroke-linecap="round"/>
-                        <line class="icon-accent" x1="327" y1="240" x2="410" y2="240" stroke-width="6" stroke-linecap="round"/>
-                        <line class="icon-accent" x1="230" y1="256" x2="275" y2="256" stroke-width="8" stroke-linecap="round"/>
-                        <path class="icon-accent" d="M265 246 L280 256 L265 266" fill="none" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M60 80 L190 80 Q210 80 210 100 L210 412 Q210 432 190 432 L60 432 Z" stroke="currentColor" stroke-width="16"/>
+                        <line x1="85" y1="140" x2="185" y2="140" stroke="currentColor" stroke-width="12" stroke-linecap="round"/>
+                        <line x1="85" y1="190" x2="160" y2="190" stroke="currentColor" stroke-width="12" stroke-linecap="round"/>
+                        <line x1="85" y1="240" x2="175" y2="240" stroke="currentColor" stroke-width="12" stroke-linecap="round"/>
+                        <path class="icon-accent" d="M302 80 L432 80 Q452 80 452 100 L452 412 Q452 432 432 432 L302 432 Z" fill="none" stroke-width="16"/>
+                        <line class="icon-accent" x1="327" y1="140" x2="427" y2="140" stroke-width="12" stroke-linecap="round"/>
+                        <line class="icon-accent" x1="327" y1="190" x2="390" y2="190" stroke-width="12" stroke-linecap="round"/>
+                        <line class="icon-accent" x1="327" y1="240" x2="410" y2="240" stroke-width="12" stroke-linecap="round"/>
+                        <line class="icon-accent" x1="230" y1="256" x2="275" y2="256" stroke-width="16" stroke-linecap="round"/>
+                        <path class="icon-accent" d="M265 246 L280 256 L265 266" fill="none" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
                     </svg>
                 </button>
                 <button class="icon-btn" id="edit-toggle" title="Edit mode">
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
                         <rect class="icon-bg" width="512" height="512" rx="96"/>
-                        <path d="M340 100 L412 172 L172 412 L100 412 L100 340 Z" fill="none" stroke="currentColor" stroke-width="8" stroke-linejoin="round"/>
-                        <line x1="140" y1="372" x2="172" y2="340" stroke="currentColor" stroke-width="8" stroke-linecap="round"/>
-                        <line class="icon-accent" x1="340" y1="100" x2="412" y2="172" stroke-width="8" stroke-linecap="round"/>
-                        <line x1="300" y1="140" x2="372" y2="212" stroke="currentColor" stroke-width="8" stroke-linecap="round"/>
+                        <path d="M340 100 L412 172 L172 412 L100 412 L100 340 Z" fill="none" stroke="currentColor" stroke-width="16" stroke-linejoin="round"/>
+                        <line x1="140" y1="372" x2="172" y2="340" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+                        <line class="icon-accent" x1="340" y1="100" x2="412" y2="172" stroke-width="16" stroke-linecap="round"/>
+                        <line x1="300" y1="140" x2="372" y2="212" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
                     </svg>
                 </button>
             </div>
@@ -2762,13 +2871,13 @@ HTML_PAGE = '''<!DOCTYPE html>
             </div>
             <div id="device-help" class="help-accordion">
                 <div class="help-title">Field Reference</div>
-                <div class="help-item"><strong>IP Address</strong> — LAN IP (192.168.x.x). Used by DeQ server for WOL, SSH, and ping.</div>
-                <div class="help-item"><strong>Icon</strong> — Lucide icon name. Browse all at <a href="https://lucide.dev/icons" target="_blank">lucide.dev/icons</a></div>
-                <div class="help-item"><strong>Wake-on-LAN</strong> — MAC address for magic packet. Broadcast is usually your IP ending in .255</div>
-                <div class="help-item"><strong>RDP / VNC</strong> — Port only (e.g. 3389) → uses device IP. Full IP:port (e.g. 100.64.1.5:3389) → uses that directly.</div>
-                <div class="help-item"><strong>Web</strong> — Full URL required (e.g. http://192.168.1.100 or http://100.64.1.5:8080)</div>
-                <div class="help-item"><strong>Docker</strong> — Container name must match exactly. RDP/VNC/Web work the same as above.</div>
-                <div class="help-item"><strong>SSH</strong> — Required for stats and shutdown. User needs sudo access for shutdown.</div>
+                <div class="help-item"><strong>IP Address</strong> - LAN IP (192.168.x.x). Used by DeQ server for WOL, SSH, and ping.</div>
+                <div class="help-item"><strong>Icon</strong> - Lucide icon name. Browse all at <a href="https://lucide.dev/icons" target="_blank">lucide.dev/icons</a></div>
+                <div class="help-item"><strong>Wake-on-LAN</strong> - MAC address for magic packet. Broadcast is usually your IP ending in .255</div>
+                <div class="help-item"><strong>RDP / VNC</strong> - Port only (e.g. 3389) → uses device IP. Full IP:port (e.g. 100.64.1.5:3389) → uses that directly.</div>
+                <div class="help-item"><strong>Web</strong> - Full URL required (e.g. http://192.168.1.100 or http://100.64.1.5:8080)</div>
+                <div class="help-item"><strong>Docker</strong> - Container name must match exactly. RDP/VNC/Web work the same as above.</div>
+                <div class="help-item"><strong>SSH</strong> - Required for stats and shutdown. User needs sudo access for shutdown.</div>
             </div>
             <form id="device-form">
                 <input type="hidden" id="device-id">
@@ -2823,7 +2932,10 @@ HTML_PAGE = '''<!DOCTYPE html>
                 <div class="form-section">
                     <div class="form-section-title" style="display: flex; justify-content: space-between; align-items: center;">
                         Docker Containers (optional)
-                        <button type="button" class="icon-btn" onclick="addContainerRow()" style="padding: 4px;">+</button>
+                        <div style="display: flex; gap: 4px;">
+                            <button type="button" class="btn btn-secondary" onclick="scanContainers()" id="scan-containers-btn" style="padding: 4px 8px; font-size: 11px;">Scan</button>
+                            <button type="button" class="icon-btn" onclick="addContainerRow()" style="padding: 4px;">+</button>
+                        </div>
                     </div>
                     <div id="device-containers-list"></div>
                 </div>
@@ -3288,9 +3400,9 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         // === Theme ===
         const defaultTheme = {
-            bg: '#0a0a0f',
-            cards: '#12121a',
-            border: '#2a2a3a',
+            bg: '#161616',
+            cards: '#151515',
+            border: '#2b2b2b',
             text: '#e0e0e0',
             textMuted: '#808090',
             accent: '#2ed573',
@@ -3986,6 +4098,58 @@ HTML_PAGE = '''<!DOCTYPE html>
             list.appendChild(row);
         }
 
+        async function scanContainers() {
+            const deviceId = document.getElementById('device-id').value;
+
+            if (!deviceId) {
+                toast('Save the device first, then scan for containers', 'error');
+                return;
+            }
+
+            const btn = document.getElementById('scan-containers-btn');
+            btn.disabled = true;
+
+            try {
+                const res = await api(`device/${deviceId}/scan-containers`);
+
+                if (!res.success) {
+                    toast(res.error || 'Scan failed', 'error');
+                    return;
+                }
+
+                if (!res.containers || res.containers.length === 0) {
+                    toast('No containers found');
+                    return;
+                }
+
+                const existingNames = new Set();
+                document.querySelectorAll('.container-form-row .container-name').forEach(input => {
+                    if (input.value.trim()) {
+                        existingNames.add(input.value.trim());
+                    }
+                });
+
+                let added = 0;
+                for (const name of res.containers) {
+                    if (!existingNames.has(name)) {
+                        addContainerRow({ name });
+                        added++;
+                    }
+                }
+
+                if (added > 0) {
+                    toast(`Added ${added} container(s)`);
+                } else {
+                    toast('All containers already configured');
+                }
+
+            } catch (e) {
+                toast('Scan failed', 'error');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
         function getContainersFromForm() {
             const rows = document.querySelectorAll('.container-form-row');
             const containers = [];
@@ -4558,7 +4722,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             document.getElementById('fm-delete').disabled = totalSel === 0 || fmState.busy;
             document.getElementById('fm-zip').disabled = totalSel === 0 || fmState.busy;
 
-            // Download: exactly one file (not folder)
+            // Download: one file (not folder)
             let canDownload = false;
             if (totalSel === 1) {
                 const pane = leftSel === 1 ? 'left' : 'right';
@@ -5340,7 +5504,7 @@ MANIFEST_JSON = json.dumps({
     "display": "standalone",
     "background_color": "#0a0a0f",
     "theme_color": "#0a0a0f",
-    "orientation": "portrait",
+    "orientation": "any",
     "icons": [
         {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
     ]
@@ -5350,13 +5514,13 @@ MANIFEST_JSON = json.dumps({
 ICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <rect width="512" height="512" rx="96" fill="#222"/>
   <!-- D -->
-  <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="#666" stroke-width="8"/>
+  <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="#e0e0e0" stroke-width="16"/>
   <!-- e -->
-  <path d="M430 155 L432 100 Q432 80 412 80 L302 80 Q282 80 282 100 L282 210 Q282 230 302 230 L430 230" fill="none" stroke="#666" stroke-width="8" stroke-linecap="round"/>
-  <line x1="400" y1="155" x2="428" y2="155" stroke="#666" stroke-width="8" stroke-linecap="round"/>
+  <path d="M430 155 L432 100 Q432 80 412 80 L302 80 Q282 80 282 100 L282 210 Q282 230 302 230 L430 230" fill="none" stroke="#e0e0e0" stroke-width="16" stroke-linecap="round"/>
+  <line x1="400" y1="155" x2="428" y2="155" stroke="#e0e0e0" stroke-width="16" stroke-linecap="round"/>
   <!-- Q -->
-  <path d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke="#2ed573" stroke-width="8" stroke-linecap="round"/>
-  <line x1="405" y1="405" x2="435" y2="435" stroke="#2ed573" stroke-width="8" stroke-linecap="round"/>
+  <path d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke="#2ed573" stroke-width="16" stroke-linecap="round"/>
+  <line x1="405" y1="405" x2="435" y2="435" stroke="#2ed573" stroke-width="16" stroke-linecap="round"/>
 </svg>'''
 
 # === TASK EXECUTION ===
@@ -5819,13 +5983,38 @@ class RequestHandler(BaseHTTPRequestHandler):
                         self.send_json({"success": False, "error": "Device not found"}, 404)
                         return
                     
+                    if action == 'scan-containers':
+                        result = scan_docker_containers(dev)
+                        self.send_json(result)
+                        return
+
                     if action == 'status':
-                        # Get container statuses (containers are now objects with 'name' key)
+                        # Get container statuses
                         containers = dev.get('docker', {}).get('containers', [])
                         container_statuses = {}
+                        is_host = dev.get('is_host', False)
+                        ssh_config = dev.get('ssh', {})
+
                         for c in containers:
                             cname = c.get('name') if isinstance(c, dict) else c
-                            result = docker_action(cname, 'status')
+
+                            if not is_valid_container_name(cname):
+                                container_statuses[cname] = 'invalid'
+                                continue
+
+                            if is_host:
+                                result = docker_action(cname, 'status')
+                            elif ssh_config.get('user'):
+                                result = remote_docker_action(
+                                    dev['ip'],
+                                    ssh_config['user'],
+                                    ssh_config.get('port', 22),
+                                    cname,
+                                    'status'
+                                )
+                            else:
+                                result = {"success": False}
+
                             if result.get('success'):
                                 container_statuses[cname] = result.get('status', 'unknown')
                             else:
@@ -5873,13 +6062,34 @@ class RequestHandler(BaseHTTPRequestHandler):
                     if action == 'docker' and len(parts) >= 5:
                         container_name = parts[3]
                         docker_act = parts[4]
+
+                        if not is_valid_container_name(container_name):
+                            self.send_json({"success": False, "error": "Invalid container name"})
+                            return
+
                         containers = dev.get('docker', {}).get('containers', [])
                         container_names = [c.get('name') if isinstance(c, dict) else c for c in containers]
-                        if container_name in container_names:
-                            result = docker_action(container_name, docker_act)
-                            self.send_json(result)
-                        else:
+
+                        if container_name not in container_names:
                             self.send_json({"success": False, "error": f"Container '{container_name}' not configured"})
+                            return
+
+                        if dev.get('is_host'):
+                            result = docker_action(container_name, docker_act)
+                        else:
+                            ssh_config = dev.get('ssh', {})
+                            if ssh_config.get('user'):
+                                result = remote_docker_action(
+                                    dev['ip'],
+                                    ssh_config['user'],
+                                    ssh_config.get('port', 22),
+                                    container_name,
+                                    docker_act
+                                )
+                            else:
+                                result = {"success": False, "error": "SSH not configured"}
+
+                        self.send_json(result)
                         return
 
                     # Browse folders: /api/device/{id}/browse?path=/
@@ -6118,3 +6328,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
