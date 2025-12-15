@@ -13,3 +13,22 @@ Under the following terms:
 No additional restrictions — You may not apply legal terms or technological measures that legally restrict others from doing anything the license permits.
 
 Full license text: https://creativecommons.org/licenses/by-nc/4.0/legalcode
+
+DISCLAIMER
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+DeQ runs with root privileges and provides direct access to your system,
+including filesystem operations, network commands, and remote execution via SSH.
+By installing and using DeQ, you accept full responsibility for:
+- Securing your network and system
+- Restricting access via VPN (Tailscale, Wireguard, etc.)
+- Any damages resulting from misconfiguration or unauthorized access
+
+Never expose DeQ directly to the public internet.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-DeQ - Homelab Admin Dashboard
+DeQ - Alles schläft, einer wacht.
+A mighty pocket rocket for your homelab. Breaking conventions - single file, no Docker, raw control.
 Control devices, view stats, manage links and files - all in one place.
 USE BEHIND VPN ONLY! DO NOT EXPOSE TO PUBLIC INTERNET!
 
@@ -22,7 +23,7 @@ DEFAULT_PORT = 5050
 DATA_DIR = "/opt/deq"
 CONFIG_FILE = f"{DATA_DIR}/config.json"
 HISTORY_DIR = f"{DATA_DIR}/history"
-VERSION = "0.9.3"
+VERSION = "0.9.4"
 
 # === DEFAULT CONFIG ===
 DEFAULT_HOST_DEVICE = {
@@ -825,6 +826,186 @@ def scan_docker_containers(device):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+def get_default_ssh_user():
+    """Get default SSH user from /home/ directory."""
+    try:
+        home_dirs = [d for d in os.listdir('/home') if os.path.isdir(f'/home/{d}')]
+        home_dirs = [d for d in home_dirs if not d.startswith('.')]
+        if home_dirs:
+            return sorted(home_dirs)[0]
+    except:
+        pass
+    return "root"
+
+def scan_network():
+    """Scan for devices via Tailscale and ARP cache."""
+    devices = []
+    source = "none"
+    default_ssh_user = get_default_ssh_user()
+
+    # Try Tailscale first
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            source = "tailscale"
+
+            # Ping online peers to fill ARP cache
+            for peer in data.get('Peer', {}).values():
+                if peer.get('Online'):
+                    ts_ips = peer.get('TailscaleIPs', [])
+                    if ts_ips:
+                        ping_host(ts_ips[0], timeout=0.2)
+
+            # Re-fetch tailscale status after pings (CurAddr may be populated now)
+            result = subprocess.run(
+                ["tailscale", "status", "--json"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+
+            # Read ARP cache after pings
+            arp_cache = {}
+            try:
+                with open('/proc/net/arp', 'r') as f:
+                    for line in f.readlines()[1:]:
+                        parts = line.split()
+                        if len(parts) >= 4 and parts[2] == '0x2':
+                            ip = parts[0]
+                            mac = parts[3]
+                            if mac != '00:00:00:00:00:00':
+                                arp_cache[ip] = mac
+            except:
+                pass
+
+            # Get self node to exclude
+            self_node = data.get('Self', {}).get('HostName', '')
+
+            for peer_id, peer in data.get('Peer', {}).items():
+                hostname = peer.get('HostName', '')
+                if not hostname or hostname == 'localhost':
+                    dns_name = peer.get('DNSName', '')
+                    hostname = dns_name.split('.')[0] if dns_name else ''
+                if not hostname or hostname == self_node:
+                    continue
+
+                tailscale_ip = None
+                tailscale_ips = peer.get('TailscaleIPs', [])
+                for ts_ip in tailscale_ips:
+                    if ts_ip.startswith('100.'):
+                        tailscale_ip = ts_ip
+                        break
+
+                # Extract LAN IP from CurAddr (format: 192.168.x.x:port)
+                lan_ip = None
+                cur_addr = peer.get('CurAddr', '')
+                if cur_addr and not cur_addr.startswith('100.') and not cur_addr.startswith('['):
+                    lan_ip = cur_addr.rsplit(':', 1)[0]
+                    if lan_ip.startswith('100.') or not lan_ip[0].isdigit():
+                        lan_ip = None
+
+                mac = arp_cache.get(lan_ip) if lan_ip else None
+                os_type = peer.get('OS', '').lower()
+                online = peer.get('Online', False)
+
+                devices.append({
+                    "hostname": hostname,
+                    "tailscale_ip": tailscale_ip,
+                    "lan_ip": lan_ip,
+                    "mac": mac,
+                    "os": os_type,
+                    "online": online
+                })
+    except:
+        pass
+
+    # Fallback to ARP only if no Tailscale
+    if source == "none":
+        arp_cache = {}
+        try:
+            with open('/proc/net/arp', 'r') as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[2] == '0x2':
+                        ip = parts[0]
+                        mac = parts[3]
+                        if mac != '00:00:00:00:00:00':
+                            arp_cache[ip] = mac
+        except:
+            pass
+        if arp_cache:
+            source = "arp"
+            for ip, mac in arp_cache.items():
+                devices.append({
+                    "hostname": None,
+                    "tailscale_ip": None,
+                    "lan_ip": ip,
+                    "mac": mac,
+                    "os": None,
+                    "online": True
+                })
+
+    return {"success": True, "source": source, "devices": devices, "default_ssh_user": default_ssh_user}
+
+def get_all_container_statuses(device):
+    """Get status of all containers with single docker ps call."""
+    containers = device.get('docker', {}).get('containers', [])
+    if not containers:
+        return {}
+
+    configured_names = set(
+        c.get('name') if isinstance(c, dict) else c
+        for c in containers
+    )
+
+    is_host = device.get('is_host', False)
+
+    if is_host:
+        try:
+            result = subprocess.run(
+                ["docker", "ps", "-a", "--format", "{{.Names}}:{{.State}}"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode != 0:
+                return {name: 'unknown' for name in configured_names}
+        except:
+            return {name: 'unknown' for name in configured_names}
+    else:
+        ssh_config = device.get('ssh', {})
+        user = ssh_config.get('user')
+        port = ssh_config.get('port', 22)
+        ip = device.get('ip')
+
+        if not user:
+            return {name: 'unknown' for name in configured_names}
+
+        try:
+            result = subprocess.run(
+                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                 "-p", str(port), f"{user}@{ip}",
+                 "docker ps -a --format '{{.Names}}:{{.State}}'"],
+                capture_output=True, text=True, timeout=15
+            )
+            if result.returncode != 0:
+                return {name: 'unknown' for name in configured_names}
+        except:
+            return {name: 'unknown' for name in configured_names}
+
+    all_statuses = {}
+    for line in result.stdout.strip().split('\n'):
+        if ':' in line:
+            name, state = line.split(':', 1)
+            all_statuses[name] = state.lower()
+
+    return {
+        name: all_statuses.get(name, 'unknown')
+        for name in configured_names
+    }
+
 def docker_action(container, action):
     if not is_valid_container_name(container):
         return {"success": False, "error": "Invalid container name"}
@@ -1016,7 +1197,8 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         .logo svg .icon-accent,
         #files-btn svg .icon-accent,
-        #edit-toggle svg .icon-accent {
+        #edit-toggle svg .icon-accent,
+        #onboarding-modal .icon-accent {
             stroke: var(--accent);
         }
 
@@ -1379,6 +1561,115 @@ HTML_PAGE = '''<!DOCTYPE html>
             to { transform: rotate(360deg); }
         }
 
+        .onboarding-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 12px;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }
+        .onboarding-row input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: var(--accent);
+        }
+        .onboarding-row input[type="text"] {
+            padding: 4px 8px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-primary);
+            font-size: 12px;
+        }
+        .onboarding-row input[type="text"].ob-name {
+            flex: 1;
+            min-width: 100px;
+            max-width: 140px;
+        }
+        .onboarding-row input[type="text"].ob-ssh {
+            width: 70px;
+            font-family: monospace;
+        }
+        .onboarding-row .ob-ip {
+            font-size: 11px;
+            color: var(--text-secondary);
+            min-width: 100px;
+        }
+        .onboarding-row .ob-mac {
+            font-size: 11px;
+            color: var(--text-secondary);
+            min-width: 90px;
+            font-family: monospace;
+        }
+        .onboarding-row .ob-status {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-secondary);
+            flex-shrink: 0;
+            margin-left: auto;
+        }
+        .onboarding-row .ob-status.online {
+            background: var(--accent);
+        }
+        .onboarding-row.disabled {
+            opacity: 0.5;
+            pointer-events: none;
+        }
+        .onboarding-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 0 12px 8px;
+            font-size: 11px;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 8px;
+        }
+        .onboarding-header span:nth-child(1) { width: 16px; }
+        .onboarding-header span:nth-child(2) { flex: 1; min-width: 100px; max-width: 140px; }
+        .onboarding-header span:nth-child(3) { width: 70px; }
+        .onboarding-header span:nth-child(4) { min-width: 100px; }
+        .onboarding-header span:nth-child(5) { min-width: 100px; }
+        .onboarding-header span:nth-child(6) { min-width: 90px; }
+        .onboarding-header span:nth-child(7) { width: 8px; }
+        .docker-scan-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 12px;
+            background: var(--bg-secondary);
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }
+        .docker-scan-row input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: var(--accent);
+        }
+        .docker-scan-row .ds-name {
+            flex: 1;
+            font-size: 13px;
+        }
+        .docker-scan-row .ds-status {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+        .docker-scan-row .ds-status.success {
+            color: var(--accent);
+        }
+        .docker-scan-row .ds-status.error {
+            color: #ff6b6b;
+        }
+        .docker-scan-row.no-ssh {
+            opacity: 0.5;
+        }
+        .docker-scan-row.no-ssh input[type="checkbox"] {
+            display: none;
+        }
+
         /* Stats bars */
         .device-stats-bars {
             display: flex;
@@ -1735,9 +2026,44 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
 
         .device-containers {
-            border-top: 1px solid var(--border);
-            margin-top: 12px;
-            padding-top: 12px;
+            margin-top: 4px;
+            padding-top: 0;
+        }
+
+        .containers-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            user-select: none;
+            margin-left: auto;
+        }
+
+        .containers-summary {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        .containers-chevron {
+            width: 14px;
+            height: 14px;
+            transition: transform 0.2s;
+            color: var(--text-secondary);
+        }
+
+        .containers-chevron.expanded {
+            transform: rotate(180deg);
+        }
+
+        .containers-list {
+            display: none;
+        }
+
+        .containers-list.expanded {
+            display: block;
         }
 
         .container-row {
@@ -1966,10 +2292,10 @@ HTML_PAGE = '''<!DOCTYPE html>
             padding: 24px;
             width: 100%;
             max-width: 500px;
-            max-height: 80vh;
+            max-height: 92vh;
             overflow-y: auto;
         }
-        
+
         .modal-header {
             display: flex;
             justify-content: space-between;
@@ -2593,7 +2919,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             color: var(--bg-primary);
             border: none;
             border-radius: 6px;
-            padding: 10px 16px;
+            padding: 8px 10px;
             font-family: inherit;
             font-size: 12px;
             font-weight: 500;
@@ -2616,8 +2942,9 @@ HTML_PAGE = '''<!DOCTYPE html>
         
         .modal-actions {
             display: flex;
+            flex-wrap: wrap;
             gap: 8px;
-            justify-content: flex-end;
+            justify-content: center;
             margin-top: 20px;
         }
         
@@ -2728,6 +3055,9 @@ HTML_PAGE = '''<!DOCTYPE html>
                         <span id="device-layout-label">1</span>
                     </button>
                 </div>
+                <button class="icon-btn section-add" id="scan-devices" title="Scan for devices" onclick="startOnboarding(true)">
+                    <i data-lucide="radar"></i>
+                </button>
                 <button class="icon-btn section-add" id="add-device" title="Add device">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <line x1="12" y1="5" x2="12" y2="19"></line>
@@ -3258,7 +3588,96 @@ HTML_PAGE = '''<!DOCTYPE html>
     <!-- Toast -->
     <div class="toast" id="toast"></div>
 
+    <!-- Onboarding Modal -->
+    <div class="modal" id="onboarding-modal">
+        <div class="modal-content" style="max-width: 700px;">
+            <div class="modal-header">
+                <div style="display: flex; align-items: center; gap: 12px;">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" style="width: 32px; height: 32px;">
+                        <rect class="icon-bg" width="512" height="512" rx="96"/>
+                        <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="currentColor" stroke-width="16"/>
+                        <path d="M430 155 L432 100 Q432 80 412 80 L302 80 Q282 80 282 100 L282 210 Q282 230 302 230 L430 230" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+                        <line x1="400" y1="155" x2="428" y2="155" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+                        <path class="icon-accent" d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke-width="16" stroke-linecap="round"/>
+                        <line class="icon-accent" x1="405" y1="405" x2="435" y2="435" stroke-width="16" stroke-linecap="round"/>
+                    </svg>
+                    <span class="modal-title" id="onboarding-title">Welcome to DeQ!</span>
+                </div>
+                <button class="modal-close" onclick="closeOnboarding(true)">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+            <div id="onboarding-content">
+                <div id="onboarding-loading" style="text-align: center; padding: 40px;">
+                    <p style="margin-bottom: 20px; color: var(--text-primary);">Your new Admin Dash.</p>
+                    <div class="container-spinner active" style="width: 24px; height: 24px; margin: 0 auto;"></div>
+                    <p style="margin-top: 16px; color: var(--text-secondary);">Scanning your network...</p>
+                </div>
+                <div id="onboarding-devices" style="display: none;">
+                    <p style="color: var(--text-secondary); margin-bottom: 12px;">We found these devices. Select the ones you want to add:</p>
+                    <div id="onboarding-device-list" style="max-height: 280px; overflow-y: auto;"></div>
+                    <p style="color: var(--text-secondary); font-size: 11px; margin-top: 12px;">Don't see a device? You can always add more manually later.</p>
+                </div>
+                <div id="onboarding-empty" style="display: none; text-align: center; padding: 40px;">
+                    <p style="color: var(--text-primary); margin-bottom: 8px;">Your new Admin Dash.</p>
+                    <p style="color: var(--text-secondary);">We couldn't find any devices on your network.</p>
+                    <p style="color: var(--text-secondary); font-size: 12px; margin-top: 8px;">No worries - you can add them manually from the dashboard.</p>
+                </div>
+            </div>
+            <div class="modal-actions" id="onboarding-actions" style="display: none;">
+                <button type="button" class="btn btn-secondary" onclick="onboardingSelectAll()">All</button>
+                <button type="button" class="btn btn-secondary" onclick="onboardingSelectNone()">None</button>
+                <button type="button" class="btn btn-secondary" onclick="onboardingSelectLinux()">Linux</button>
+                <button type="button" class="btn btn-secondary" id="onboarding-skip-btn" onclick="closeOnboarding(true)">Skip</button>
+                <button type="button" class="btn btn-primary" onclick="addOnboardingDevices()">Add</button>
+            </div>
+            <div class="modal-actions" id="onboarding-empty-actions" style="display: none;">
+                <button type="button" class="btn btn-primary" onclick="closeOnboarding(true)">Get Started</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Docker Scan Modal -->
+    <div class="modal" id="docker-scan-modal">
+        <div class="modal-content" style="max-width: 500px;">
+            <div class="modal-header">
+                <span class="modal-title">Scan for Docker containers?</span>
+                <button class="modal-close" onclick="closeDockerScan()">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+            <div id="docker-scan-content">
+                <div id="docker-scan-checking" style="text-align: center; padding: 30px;">
+                    <div class="container-spinner active" style="width: 24px; height: 24px; margin: 0 auto;"></div>
+                    <p style="margin-top: 16px; color: var(--text-secondary);">Checking SSH access...</p>
+                </div>
+                <div id="docker-scan-available" style="display: none;">
+                    <p style="color: var(--text-secondary); margin-bottom: 12px;">SSH access available on:</p>
+                    <div id="docker-scan-list" style="max-height: 200px; overflow-y: auto;"></div>
+                </div>
+                <div id="docker-scan-none" style="display: none; text-align: center; padding: 20px;">
+                    <p style="color: var(--text-secondary);">No SSH access configured yet.</p>
+                    <p style="color: var(--text-secondary); font-size: 12px; margin-top: 8px;">To scan for Docker containers, set up SSH keys first.<br>You can configure SSH later in device settings.</p>
+                </div>
+            </div>
+            <div class="modal-actions" id="docker-scan-actions" style="display: none;">
+                <button type="button" class="btn btn-secondary" onclick="closeDockerScan()">Skip</button>
+                <button type="button" class="btn btn-primary" onclick="runDockerScan()">Scan</button>
+            </div>
+            <div class="modal-actions" id="docker-scan-none-actions" style="display: none;">
+                <button type="button" class="btn btn-primary" onclick="closeDockerScan()">Continue</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        const NEEDS_ONBOARDING = __NEEDS_ONBOARDING__;
         // UUID fallback for non-secure contexts (HTTP)
         function generateUUID() {
             if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -3797,43 +4216,73 @@ HTML_PAGE = '''<!DOCTYPE html>
 
                 // Docker containers section
                 const containers = dev.docker?.containers || [];
-                let containersHtml = '';
+                let containersToggle = '';
+                let containersListHtml = '';
                 if (containers.length > 0) {
-                    containersHtml = `
+                    // Count running vs stopped
+                    let runningCount = 0;
+                    let stoppedCount = 0;
+                    containers.forEach(c => {
+                        const cName = typeof c === 'string' ? c : c.name;
+                        const cStatus = containerStats[cName];
+                        if (cStatus === 'running') runningCount++;
+                        else if (cStatus !== undefined) stoppedCount++;
+                    });
+
+                    // Check if expanded (default: true)
+                    const isExpanded = config.settings?.accordion?.[dev.id] !== false;
+
+                    // Toggle button for actions row
+                    containersToggle = `
+                        <span class="containers-toggle" onclick="event.stopPropagation(); toggleContainers('${dev.id}')">
+                            <span class="containers-summary" style="${isExpanded ? 'display: none;' : ''}">
+                                ${runningCount > 0 ? `<span>${runningCount}</span><span class="status-dot online"></span>` : ''}
+                                ${stoppedCount > 0 ? `<span>${stoppedCount}</span><span class="status-dot offline"></span>` : ''}
+                            </span>
+                            <svg class="containers-chevron ${isExpanded ? 'expanded' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="6 9 12 15 18 9"></polyline>
+                            </svg>
+                        </span>
+                    `;
+
+                    // Container list
+                    containersListHtml = `
                         <div class="device-containers">
-                            ${containers.map(c => {
-                                const cName = c.name;
-                                const cStatus = containerStats[cName];
-                                const cOnline = cStatus === 'running';
-                                const cLoading = cStatus === undefined;
+                            <div class="containers-list ${isExpanded ? 'expanded' : ''}">
+                                ${containers.map(c => {
+                                    const cName = typeof c === 'string' ? c : c.name;
+                                    const cStatus = containerStats[cName];
+                                    const cOnline = cStatus === 'running';
+                                    const cLoading = cStatus === undefined;
 
-                                // Connection buttons only when container is running
-                                let connectBtns = '';
-                                if (cOnline) {
-                                    if (c.rdp) connectBtns += `<button class="device-action" onclick="event.stopPropagation(); doContainerConnect('${dev.id}', 'rdp', '${c.rdp}')">RDP</button>`;
-                                    if (c.vnc) connectBtns += `<button class="device-action" onclick="event.stopPropagation(); doContainerConnect('${dev.id}', 'vnc', '${c.vnc}')">VNC</button>`;
-                                    if (c.web) connectBtns += `<button class="device-action" onclick="event.stopPropagation(); doContainerConnect('${dev.id}', 'web', '${c.web}')">Web</button>`;
-                                }
+                                    // Connection buttons only when container is running
+                                    let connectBtns = '';
+                                    if (cOnline) {
+                                        if (c.rdp) connectBtns += `<button class="device-action" onclick="event.stopPropagation(); doContainerConnect('${dev.id}', 'rdp', '${c.rdp}')">RDP</button>`;
+                                        if (c.vnc) connectBtns += `<button class="device-action" onclick="event.stopPropagation(); doContainerConnect('${dev.id}', 'vnc', '${c.vnc}')">VNC</button>`;
+                                        if (c.web) connectBtns += `<button class="device-action" onclick="event.stopPropagation(); doContainerConnect('${dev.id}', 'web', '${c.web}')">Web</button>`;
+                                    }
 
-                                // Single Start or Stop button based on state
-                                const actionBtn = cLoading ?
-                                    `<span class="container-spinner active"></span>` :
-                                    (cOnline ?
-                                        `<button class="device-action container-stop" onclick="event.stopPropagation(); doDockerContainer('${dev.id}', '${cName}', 'stop')">Stop</button>` :
-                                        `<button class="device-action container-start" onclick="event.stopPropagation(); doDockerContainer('${dev.id}', '${cName}', 'start')">Start</button>`
-                                    );
+                                    // Single Start or Stop button based on state
+                                    const actionBtn = cLoading ?
+                                        `<span class="container-spinner active"></span>` :
+                                        (cOnline ?
+                                            `<button class="device-action container-stop" onclick="event.stopPropagation(); doDockerContainer('${dev.id}', '${cName}', 'stop')">Stop</button>` :
+                                            `<button class="device-action container-start" onclick="event.stopPropagation(); doDockerContainer('${dev.id}', '${cName}', 'start')">Start</button>`
+                                        );
 
-                                return `
-                                    <div class="container-row">
-                                        <span class="container-name ${cOnline ? 'container-online' : ''}">${cName}</span>
-                                        <div class="container-actions">
-                                            ${connectBtns ? `<span class="connect-group">${connectBtns}</span>` : ''}
-                                            ${actionBtn}
-                                            <span class="container-spinner" id="spinner-${dev.id}-${cName}"></span>
+                                    return `
+                                        <div class="container-row">
+                                            <span class="container-name ${cOnline ? 'container-online' : ''}">${cName}</span>
+                                            <div class="container-actions">
+                                                ${connectBtns ? `<span class="connect-group">${connectBtns}</span>` : ''}
+                                                ${actionBtn}
+                                                <span class="container-spinner" id="spinner-${dev.id}-${cName}"></span>
+                                            </div>
                                         </div>
-                                    </div>
-                                `;
-                            }).join('')}
+                                    `;
+                                }).join('')}
+                            </div>
                         </div>
                     `;
                 }
@@ -3874,12 +4323,13 @@ HTML_PAGE = '''<!DOCTYPE html>
                             ` : ''}
                         </div>
                     ` : ''}
-                    ${actions.length ? `
+                    ${actions.length || containersToggle ? `
                         <div class="device-actions">
                             ${actions.join('<span class="action-separator">·</span>')}
+                            ${containersToggle}
                         </div>
                     ` : ''}
-                    ${containersHtml}
+                    ${containersListHtml}
                     <div class="device-edit" onclick="editDevice('${dev.id}')">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path>
@@ -3897,6 +4347,37 @@ HTML_PAGE = '''<!DOCTYPE html>
             }).join('');
             applyDeviceLayout();
             refreshIcons();
+        }
+
+        // === Container Accordion ===
+        async function toggleContainers(deviceId) {
+            // Toggle accordion state
+            if (!config.settings.accordion) config.settings.accordion = {};
+            const currentState = config.settings.accordion[deviceId] !== false;
+            config.settings.accordion[deviceId] = !currentState;
+
+            // Update UI immediately
+            const card = document.querySelector(`.device-card[data-id="${deviceId}"]`);
+            if (card) {
+                const summary = card.querySelector('.containers-summary');
+                const chevron = card.querySelector('.containers-chevron');
+                const list = card.querySelector('.containers-list');
+
+                if (config.settings.accordion[deviceId]) {
+                    // Expanding
+                    summary.style.display = 'none';
+                    chevron.classList.add('expanded');
+                    list.classList.add('expanded');
+                } else {
+                    // Collapsing
+                    summary.style.display = '';
+                    chevron.classList.remove('expanded');
+                    list.classList.remove('expanded');
+                }
+            }
+
+            // Save to config
+            await api('config', 'POST', config);
         }
 
         // === Actions ===
@@ -4131,11 +4612,15 @@ HTML_PAGE = '''<!DOCTYPE html>
             const list = document.getElementById('device-containers-list');
             const row = document.createElement('div');
             row.className = 'container-form-row';
+            const name = typeof container === 'string' ? container : (container?.name || '');
+            const rdp = typeof container === 'object' ? (container?.rdp || '') : '';
+            const vnc = typeof container === 'object' ? (container?.vnc || '') : '';
+            const web = typeof container === 'object' ? (container?.web || '') : '';
             row.innerHTML = `
-                <input type="text" class="form-input container-name" placeholder="Name" value="${container?.name || ''}">
-                <input type="text" class="form-input container-rdp" placeholder="RDP" value="${container?.rdp || ''}" style="max-width: 100px;">
-                <input type="text" class="form-input container-vnc" placeholder="VNC" value="${container?.vnc || ''}" style="max-width: 100px;">
-                <input type="text" class="form-input container-web" placeholder="Web URL" value="${container?.web || ''}">
+                <input type="text" class="form-input container-name" placeholder="Name" value="${name}">
+                <input type="text" class="form-input container-rdp" placeholder="RDP" value="${rdp}" style="max-width: 100px;">
+                <input type="text" class="form-input container-vnc" placeholder="VNC" value="${vnc}" style="max-width: 100px;">
+                <input type="text" class="form-input container-web" placeholder="Web URL" value="${web}">
                 <button type="button" class="remove-btn" onclick="this.parentElement.remove()">×</button>
             `;
             list.appendChild(row);
@@ -4385,7 +4870,8 @@ HTML_PAGE = '''<!DOCTYPE html>
             const containers = [];
             config.devices.forEach(dev => {
                 (dev.docker?.containers || []).forEach(c => {
-                    containers.push({ name: c.name, device: dev.name, deviceId: dev.id });
+                    const name = typeof c === 'string' ? c : c.name;
+                    if (name) containers.push({ name, device: dev.name, deviceId: dev.id });
                 });
             });
             const containerOptions = containers.map(c =>
@@ -5479,11 +5965,18 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
         
         async function loadDeviceStatus() {
-            for (const dev of config.devices) {
-                const res = await api(`device/${dev.id}/status`);
-                deviceStats[dev.id] = res;
-            }
-            renderDevices();
+            const promises = config.devices.map(dev =>
+                api(`device/${dev.id}/status`)
+                    .then(res => {
+                        deviceStats[dev.id] = res;
+                        renderDevices();
+                    })
+                    .catch(() => {
+                        deviceStats[dev.id] = { online: false, stats: null, containers: {} };
+                        renderDevices();
+                    })
+            );
+            await Promise.all(promises);
         }
         
         
@@ -5531,8 +6024,228 @@ HTML_PAGE = '''<!DOCTYPE html>
             }
         });
 
+        // === Onboarding ===
+        let onboardingDevices = [];
+        let defaultSshUser = 'root';
+        const OS_ICONS = {linux: 'server', windows: 'monitor', android: 'smartphone', ios: 'smartphone', macos: 'laptop'};
+
+        async function startOnboarding(isRescan = false) {
+            document.getElementById('onboarding-title').textContent = isRescan ? 'Scan for devices' : "Welcome to DeQ!";
+            document.getElementById('onboarding-loading').style.display = 'block';
+            document.getElementById('onboarding-devices').style.display = 'none';
+            document.getElementById('onboarding-empty').style.display = 'none';
+            document.getElementById('onboarding-actions').style.display = 'none';
+            document.getElementById('onboarding-empty-actions').style.display = 'none';
+            openModal('onboarding-modal');
+
+            const res = await api('network/scan');
+            onboardingDevices = res.devices || [];
+            defaultSshUser = res.default_ssh_user || 'root';
+
+            // Filter out already existing devices (by IP)
+            const existingIPs = new Set(config.devices.map(d => d.ip));
+            if (isRescan) {
+                onboardingDevices = onboardingDevices.filter(d => {
+                    if (d.lan_ip && existingIPs.has(d.lan_ip)) return false;
+                    if (d.tailscale_ip && existingIPs.has(d.tailscale_ip)) return false;
+                    return d.lan_ip || d.tailscale_ip;
+                });
+            }
+
+            document.getElementById('onboarding-loading').style.display = 'none';
+
+            if (onboardingDevices.length === 0) {
+                document.getElementById('onboarding-empty').style.display = 'block';
+                document.getElementById('onboarding-empty-actions').style.display = 'flex';
+                return;
+            }
+
+            const list = document.getElementById('onboarding-device-list');
+            list.innerHTML = onboardingDevices.map((d, i) => {
+                const isLinux = d.os === 'linux';
+                const hostname = d.hostname || d.lan_ip || 'Unknown';
+                const tsIp = d.tailscale_ip || '—';
+                const lanIp = d.lan_ip || '—';
+                const mac = d.mac || '—';
+                return `<div class="onboarding-row" data-index="${i}" data-os="${d.os || ''}">
+                    <input type="checkbox" ${isLinux ? 'checked' : ''}>
+                    <input type="text" class="ob-name" value="${hostname}">
+                    <input type="text" class="ob-ssh" value="${defaultSshUser}" placeholder="user">
+                    <span class="ob-ip">${tsIp}</span>
+                    <span class="ob-ip">${lanIp}</span>
+                    <span class="ob-mac">${mac}</span>
+                    <span class="ob-status ${d.online ? 'online' : ''}"></span>
+                </div>`;
+            }).join('');
+            list.innerHTML = `<div class="onboarding-header">
+                <span></span><span>Name</span><span>SSH</span><span>Tailscale IP</span><span>LAN IP</span><span>MAC</span><span></span>
+            </div>` + list.innerHTML;
+
+            document.getElementById('onboarding-devices').style.display = 'block';
+            document.getElementById('onboarding-actions').style.display = 'flex';
+            document.getElementById('onboarding-skip-btn').textContent = isRescan ? 'Cancel' : 'Skip';
+        }
+
+        function onboardingSelectAll() {
+            document.querySelectorAll('#onboarding-device-list input[type="checkbox"]').forEach(cb => cb.checked = true);
+        }
+        function onboardingSelectNone() {
+            document.querySelectorAll('#onboarding-device-list input[type="checkbox"]').forEach(cb => cb.checked = false);
+        }
+        function onboardingSelectLinux() {
+            document.querySelectorAll('#onboarding-device-list .onboarding-row').forEach(row => {
+                row.querySelector('input[type="checkbox"]').checked = row.dataset.os === 'linux';
+            });
+        }
+
+        async function addOnboardingDevices() {
+            const rows = document.querySelectorAll('#onboarding-device-list .onboarding-row');
+            const addedDevices = [];
+            rows.forEach(row => {
+                const cb = row.querySelector('input[type="checkbox"]');
+                if (!cb.checked) return;
+                const name = row.querySelector('.ob-name').value.trim();
+                const sshUser = row.querySelector('.ob-ssh').value.trim();
+                const i = parseInt(row.dataset.index);
+                const d = onboardingDevices[i];
+                const ip = d.lan_ip || d.tailscale_ip;
+                if (!ip) return;
+
+                const device = {
+                    id: generateUUID(),
+                    name: name || ip,
+                    ip: ip,
+                    icon: OS_ICONS[d.os] || 'server'
+                };
+                if (d.mac && d.lan_ip) {
+                    const parts = d.lan_ip.split('.');
+                    const broadcast = parts.slice(0, 3).join('.') + '.255';
+                    device.wol = {mac: d.mac, broadcast: broadcast};
+                }
+                if (d.tailscale_ip && d.lan_ip) {
+                    device.connect = {web: 'http://' + d.tailscale_ip};
+                }
+                if (sshUser) {
+                    device.ssh = {user: sshUser};
+                }
+                config.devices.push(device);
+                addedDevices.push({...device, _online: d.online});
+            });
+            if (addedDevices.length > 0) {
+                await saveConfig();
+                renderDevices();
+                toast(`Added ${addedDevices.length} device(s)`);
+                startDockerScan(addedDevices);
+            } else {
+                closeOnboarding(true);
+            }
+        }
+
+        async function closeOnboarding(markDone = false) {
+            closeModal('onboarding-modal');
+            if (markDone && NEEDS_ONBOARDING) {
+                await api('onboarding/complete', 'POST');
+            }
+        }
+
+        // === Docker Scan ===
+        let dockerScanDevices = [];
+
+        async function startDockerScan(devices) {
+            dockerScanDevices = devices.filter(d => d.ssh && d.ssh.user);
+            if (dockerScanDevices.length === 0) {
+                closeOnboarding(true);
+                return;
+            }
+
+            closeModal('onboarding-modal');
+            document.getElementById('docker-scan-checking').style.display = 'block';
+            document.getElementById('docker-scan-available').style.display = 'none';
+            document.getElementById('docker-scan-none').style.display = 'none';
+            document.getElementById('docker-scan-actions').style.display = 'none';
+            document.getElementById('docker-scan-none-actions').style.display = 'none';
+            openModal('docker-scan-modal');
+
+            const sshResults = await Promise.all(dockerScanDevices.map(async d => {
+                if (!d._online) {
+                    return {device: d, hasSSH: false, offline: true};
+                }
+                const res = await api(`device/${d.id}/ssh-check`);
+                return {device: d, hasSSH: res.success, offline: false};
+            }));
+
+            document.getElementById('docker-scan-checking').style.display = 'none';
+
+            const withSSH = sshResults.filter(r => r.hasSSH);
+            const withoutSSH = sshResults.filter(r => !r.hasSSH);
+
+            if (withSSH.length === 0) {
+                document.getElementById('docker-scan-none').style.display = 'block';
+                document.getElementById('docker-scan-none-actions').style.display = 'flex';
+                return;
+            }
+
+            const list = document.getElementById('docker-scan-list');
+            list.innerHTML = [
+                ...withSSH.map(r => `<div class="docker-scan-row" data-id="${r.device.id}">
+                    <input type="checkbox" checked>
+                    <span class="ds-name">${r.device.name}</span>
+                    <span class="ds-status success">SSH OK</span>
+                </div>`),
+                ...withoutSSH.map(r => `<div class="docker-scan-row no-ssh">
+                    <span class="ds-name">${r.device.name}</span>
+                    <span class="ds-status error">${r.offline ? 'Offline' : 'No SSH access'}</span>
+                </div>`)
+            ].join('');
+
+            document.getElementById('docker-scan-available').style.display = 'block';
+            document.getElementById('docker-scan-actions').style.display = 'flex';
+        }
+
+        async function runDockerScan() {
+            const rows = document.querySelectorAll('#docker-scan-list .docker-scan-row:not(.no-ssh)');
+            let scanned = 0;
+            for (const row of rows) {
+                const cb = row.querySelector('input[type="checkbox"]');
+                if (!cb || !cb.checked) continue;
+                const deviceId = row.dataset.id;
+                const device = config.devices.find(d => d.id === deviceId);
+                if (!device) continue;
+
+                row.querySelector('.ds-status').textContent = 'Scanning...';
+                row.querySelector('.ds-status').className = 'ds-status';
+
+                const res = await api(`device/${deviceId}/scan-containers`);
+                if (res.success && res.containers && res.containers.length > 0) {
+                    device.docker = {containers: res.containers};
+                    row.querySelector('.ds-status').textContent = `Found ${res.containers.length}`;
+                    row.querySelector('.ds-status').className = 'ds-status success';
+                    scanned++;
+                } else {
+                    row.querySelector('.ds-status').textContent = res.error || 'No containers';
+                    row.querySelector('.ds-status').className = 'ds-status';
+                }
+            }
+            if (scanned > 0) {
+                await saveConfig();
+                renderDevices();
+            }
+            setTimeout(() => closeDockerScan(), 1000);
+        }
+
+        function closeDockerScan() {
+            closeModal('docker-scan-modal');
+            if (NEEDS_ONBOARDING) {
+                api('onboarding/complete', 'POST');
+            }
+        }
+
         // Load everything
-        loadConfig();
+        loadConfig().then(() => {
+            if (NEEDS_ONBOARDING) {
+                startOnboarding(false);
+            }
+        });
         setTimeout(startPolling, 500);
     </script>
 </body>
@@ -5975,7 +6688,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         query = parse_qs(urlparse(self.path).query)
         
         if path == '/' or path == '':
-            self.send_html(HTML_PAGE)
+            needs_onboarding = not CONFIG.get('onboarding_done') and len(CONFIG.get('devices', [])) <= 1
+            html = HTML_PAGE.replace('__NEEDS_ONBOARDING__', 'true' if needs_onboarding else 'false')
+            self.send_html(html)
             return
         
         if path == '/manifest.json':
@@ -6014,7 +6729,12 @@ class RequestHandler(BaseHTTPRequestHandler):
             if api_path == 'stats/host':
                 self.send_json({"success": True, "stats": get_local_stats()})
                 return
-            
+
+            if api_path == 'network/scan':
+                result = scan_network()
+                self.send_json(result)
+                return
+
             if api_path.startswith('device/'):
                 parts = api_path.split('/')
                 if len(parts) >= 3:
@@ -6031,39 +6751,30 @@ class RequestHandler(BaseHTTPRequestHandler):
                         self.send_json(result)
                         return
 
-                    if action == 'status':
-                        # Get container statuses
-                        containers = dev.get('docker', {}).get('containers', [])
-                        container_statuses = {}
-                        is_host = dev.get('is_host', False)
+                    if action == 'ssh-check':
                         ssh_config = dev.get('ssh', {})
-
-                        for c in containers:
-                            cname = c.get('name') if isinstance(c, dict) else c
-
-                            if not is_valid_container_name(cname):
-                                container_statuses[cname] = 'invalid'
-                                continue
-
-                            if is_host:
-                                result = docker_action(cname, 'status')
-                            elif ssh_config.get('user'):
-                                result = remote_docker_action(
-                                    dev['ip'],
-                                    ssh_config['user'],
-                                    ssh_config.get('port', 22),
-                                    cname,
-                                    'status'
-                                )
+                        if not ssh_config.get('user'):
+                            self.send_json({"success": False, "error": "No SSH user configured"})
+                            return
+                        try:
+                            result = subprocess.run(
+                                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                                 "-p", str(ssh_config.get('port', 22)), f"{ssh_config['user']}@{dev['ip']}", "echo ok"],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if result.returncode == 0 and 'ok' in result.stdout:
+                                self.send_json({"success": True})
                             else:
-                                result = {"success": False}
+                                self.send_json({"success": False, "error": "SSH auth failed"})
+                        except subprocess.TimeoutExpired:
+                            self.send_json({"success": False, "error": "SSH timeout"})
+                        except Exception as e:
+                            self.send_json({"success": False, "error": str(e)})
+                        return
 
-                            if result.get('success'):
-                                container_statuses[cname] = result.get('status', 'unknown')
-                            else:
-                                container_statuses[cname] = 'unknown'
+                    if action == 'status':
+                        container_statuses = get_all_container_statuses(dev)
 
-                        # Host device: always online, use local stats
                         if dev.get('is_host'):
                             stats = get_local_stats()
                             self.send_json({"success": True, "online": True, "stats": stats, "containers": container_statuses})
@@ -6205,7 +6916,13 @@ class RequestHandler(BaseHTTPRequestHandler):
             save_config(CONFIG)
             self.send_json({"success": True})
             return
-        
+
+        if path == '/api/onboarding/complete':
+            CONFIG['onboarding_done'] = True
+            save_config(CONFIG)
+            self.send_json({"success": True})
+            return
+
         # Task execution
         if path.startswith('/api/task/') and path.endswith('/run'):
             task_id = path.split('/')[3]
@@ -6371,4 +7088,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
