@@ -1,12 +1,11 @@
 # DeQ
+<p align="center">Rethinking homelab tools. Less complexity, more control.<p align="center"></p>
+
+<p align="center">A bare-metal homelab admin deck with root access and Android monitoring app. Small enough to live alongside Pi-hole on a Pi Zero. Capable enough to control your entire network. Get notifications on your smartphone when things go wrong.</p>
 
 ![DeQ Hero](assets/DeQ-Hero.jpg)
 
-<p align="center">A bare-metal homelab admin deck with root access. Minimal footprint, runs anywhere.<p align="center"></p>
-
-<p align="center">Small enough to live alongside Pi-hole on a Pi Zero. Capable enough to control your entire network.</p>
-
-<p align="center">**Website:** [deq.rocks](https://deq.rocks) · **Support:** [Patreon](https://patreon.com/deqrocks)</p>
+**Website:** [deq.rocks](https://deq.rocks) · **Support:** [Patreon](https://patreon.com/deqrocks)
 
 ## Concept
 
@@ -14,7 +13,7 @@
 
 It's designed for low-power devices that are already online 24/7 - a Pi, a mini PC, even a WRT router. These give you always-on access to your homelab via Tailscale or LAN, without the overhead of a full server.
 Docker would add overhead and break core features: Wake-on-LAN needs raw sockets, the file manager needs your filesystem, SSH and rsync run as host processes, and shutdown commands don't work from inside a container.
-DeQ aims to bridge monitoring and control - but with a minimal footprint as its core principle. It bridges monitoring and control - with a minimal footprint as its core principle. One file, focused scope, no bloat.
+DeQ bridges monitoring and control - with a minimal footprint as its core principle. One file, focused scope, no bloat.
 
 **This comes with responsibility.**
 
@@ -25,13 +24,14 @@ DeQ runs as root and has direct access to your system. That's what makes feature
 
 ## Features
 
+- **Android Companion app** - free app for your smartphone to manage your servers or get notified when things go wrong
 - **Device Control** - Wake-on-LAN, shutdown, Docker start/stop
 - **Scheduled Tasks** - Automated backups, wake and shutdown
 - **File Manager** - Dual-pane file browser, copy/move/upload between devices
 - **System Stats** - CPU, RAM, temperature, disk usage
 - **Quick Links** - Bookmarks to your services with custom icons (Lucide or Dashboard Icons)
 - **Theming** - Custom colors, wallpapers, and transparency/blur effects
-- **PWA Support** - Install as an app on any desktop or smartphone
+- **PWA Support** - Install as web app on any desktop or smartphone
 
 ## Installation
 
@@ -74,10 +74,12 @@ In edit mode, click the palette icon next to "Links" to toggle monochrome mode f
 <p align="center"><img src="assets/DeQ-Device-Features.jpg" width="700"></p>
 
 **Manually**
+
 You can manually add devices by activating the edit mode > go to the devices section > click "+".
 After you added the device you can manually add containers or scan for containers running on that device.
 
 **Using the Wizard**
+
 You can automatically add devices and containers by using the wizard: activate edit mode > go to the devices section > click "scan". Add your devices and SSH user name. Next step it will scan for Docker containers. Make sure to have ssh keypairs exchanged for that to work.
 
 Each device can have:
@@ -168,26 +170,61 @@ In edit mode, scroll down to the Theme section to customize the look:
 
 Click "Reset to Defaults" to restore the original dark theme.
 
-## Install as App (PWA)
+## Mobile App
+
+Control your homelab from your phone - check stats, wake devices, manage containers.
+
+### Android
+
+Native Android apps for DeQ - faster startup, background notifications, no browser needed.
+
+**Download:** Free app from the releases on github, Pro app coming soon on Playstore**
+
+#### Free vs Pro
+
+| Feature | DeQ (Free) | DeQ Pro (€4.99) |
+|---------|------------|-----------------|
+| WebView Dashboard | ✓ | ✓ |
+| Background Polling | 30 min | custom |
+| Push Notifications | ✓ | ✓ |
+| Android Auto | ✗ | ✓ |
+
+**Why a paid version?**
+
+Unlike Patreon tiers with "exclusive updates" or "Discord access", the paid app offers real features that take real work to build:
+
+- **Custom Polling**: Set your own interval - from seconds to hours
+- **Android Auto**: Check your homelab status from your car's dashboard
+
+Your support keeps this project alive as a full-time effort.
+
+### iOS
+
+Install DeQ as a PWA: Safari → Share → Add to Home Screen. Works like a native app.
+Native iOS app planned when funding allows.
+
+## Desktop App
 <p align="center"><img src="assets/DeQ-PWA-Desktop.jpg" width="700"></p>
 
-DeQ works as a Progressive Web App - install it like a native app on any device. No app store, no updates to manage.
+Install DeQ as a desktop app - no more hunting through browser tabs. One click in your dock or taskbar, and you're in.
 
 **Why install as an app?**
-- One tap access from your home screen or dock
-- No browser tabs to dig through
-- Fullscreen, distraction-free interface
-- Will serve the bookmarks that are important in your homelab context
+- Clean window without browser UI
+- Lives in your dock/taskbar - always one click away
+- No tabs to dig through
+- Same interface, instant access
 
 **How to install:**
 
 | Platform | Steps |
 |----------|-------|
-| **iOS/iPadOS** | Safari → Share button → "Add to Home Screen" |
-| **Android** | Chrome → Menu (⋮) → "Add to Home Screen" or "Install app" |
-| **macOS/Windows** | Chrome → Menu (⋮) → "Cast, save, and share" → "Install page as app..." |
+| **macOS (Safari)** | File → Add to Dock |
+| **macOS (Chrome)** | Menu (⋮) → "Cast, save, and share" → "Install page as app..." |
+| **Windows (Edge)** | Menu (···) → Apps → "Install this site as an app" |
+| **Windows (Chrome)** | Menu (⋮) → "Cast, save, and share" → "Install page as app..." |
+| **Linux** | Chrome → Menu (⋮) → "Cast, save, and share" → "Install page as app..." |
 
-Once installed, DeQ opens in its own window and feels like a native app.
+Once installed, DeQ opens in its own window and lives in your dock.
 
 ## Service Commands
 

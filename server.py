@@ -23,9 +23,11 @@ DEFAULT_PORT = 5050
 DATA_DIR = "/opt/deq"
 CONFIG_FILE = f"{DATA_DIR}/config.json"
 HISTORY_DIR = f"{DATA_DIR}/history"
-VERSION = "0.9.4"
+VERSION = "0.9.5"
 
 # === DEFAULT CONFIG ===
+DEFAULT_ALERTS = {"online": True, "cpu": 90, "ram": 90, "cpu_temp": 80, "disk_usage": 90, "disk_temp": 60, "smart": True}
+
 DEFAULT_HOST_DEVICE = {
     "id": "host",
     "name": "DeQ Host",
@@ -76,8 +78,55 @@ def save_config(config):
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f, indent=2)
 
+def get_config_with_defaults():
+    cfg = CONFIG.copy()
+    cfg['devices'] = []
+    for dev in CONFIG.get('devices', []):
+        d = dev.copy()
+        d['alerts'] = {**DEFAULT_ALERTS, **dev.get('alerts', {})}
+        cfg['devices'].append(d)
+    return cfg
+
 ensure_dirs()
 CONFIG = load_config()
+
+# === DEVICE STATUS CACHE ===
+import threading
+device_status_cache = {}
+cache_lock = threading.Lock()
+refresh_in_progress = set()
+
+def get_cached_status(device_id):
+    with cache_lock:
+        return device_status_cache.get(device_id)
+
+def set_cached_status(device_id, status):
+    with cache_lock:
+        device_status_cache[device_id] = status
+
+def refresh_device_status_async(device):
+    dev_id = device.get('id')
+    if dev_id in refresh_in_progress:
+        return
+    refresh_in_progress.add(dev_id)
+
+    def do_refresh():
+        try:
+            container_statuses = get_all_container_statuses(device)
+            if device.get('is_host'):
+                stats = get_local_stats()
+                status = {"online": True, "stats": stats, "containers": container_statuses}
+            else:
+                online = ping_host(device.get('ip', ''))
+                stats = None
+                if online and device.get('ssh', {}).get('user'):
+                    stats = get_remote_stats(device['ip'], device['ssh']['user'], device['ssh'].get('port', 22))
+                status = {"online": online, "stats": stats, "containers": container_statuses}
+            set_cached_status(dev_id, status)
+        finally:
+            refresh_in_progress.discard(dev_id)
+
+    threading.Thread(target=do_refresh, daemon=True).start()
 
 # === HISTORY MANAGEMENT ===
 def get_history_file(device_id):
@@ -116,130 +165,232 @@ def record_stats(device_id, cpu, temp):
     save_history(device_id, history)
 
 # === SYSTEM STATS (LOCAL) ===
+def get_disk_smart_info():
+    """Get SMART info and temps for all disks. Returns dict keyed by device name."""
+    disks = {}
+    try:
+        result = subprocess.run(["lsblk", "-d", "-n", "-o", "NAME,TYPE"],
+                                capture_output=True, text=True, timeout=5)
+        for line in result.stdout.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == 'disk':
+                dev_name = parts[0]
+                disks[dev_name] = {"temp": None, "smart": None}
+    except:
+        pass
+
+    for dev_name in disks:
+        try:
+            result = subprocess.run(["sudo", "smartctl", "-A", "-H", f"/dev/{dev_name}"],
+                                    capture_output=True, text=True, timeout=10)
+            output = result.stdout
+
+            if "PASSED" in output:
+                disks[dev_name]["smart"] = "ok"
+            elif "FAILED" in output:
+                disks[dev_name]["smart"] = "failed"
+
+            for line in output.split('\n'):
+                if 'Temperature' in line and '-' in line:
+                    after_dash = line.split('-')[-1].strip()
+                    first_num = after_dash.split()[0] if after_dash else ''
+                    if first_num.isdigit() and 0 < int(first_num) < 100:
+                        disks[dev_name]["temp"] = int(first_num)
+                        break
+        except:
+            pass
+
+    return disks
+
+def get_container_stats():
+    """Get CPU and RAM stats for all running containers."""
+    containers = {}
+    try:
+        result = subprocess.run(
+            ["docker", "stats", "--no-stream", "--format", "{{.Name}}:{{.CPUPerc}}:{{.MemPerc}}"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                if ':' in line:
+                    parts = line.split(':')
+                    if len(parts) >= 3:
+                        name = parts[0]
+                        cpu = parts[1].replace('%', '').strip()
+                        mem = parts[2].replace('%', '').strip()
+                        try:
+                            containers[name] = {
+                                "cpu": float(cpu),
+                                "mem": float(mem)
+                            }
+                        except:
+                            pass
+    except:
+        pass
+    return containers
+
 def get_local_stats():
     """Get stats for the device running DeQ."""
-    stats = {"cpu": 0, "ram_used": 0, "ram_total": 0, "temp": None, "disks": [], "uptime": ""}
-    
+    stats = {"cpu": 0, "ram_used": 0, "ram_total": 0, "temp": None, "disks": [], "uptime": "", "disk_smart": {}, "container_stats": {}}
+
     try:
-        # CPU load (1 min average)
         with open('/proc/loadavg', 'r') as f:
             load = float(f.read().split()[0])
-            # Get CPU count for percentage
             cpu_count = os.cpu_count() or 1
             stats["cpu"] = min(100, int(load / cpu_count * 100))
-        
-        # RAM
+
         with open('/proc/meminfo', 'r') as f:
             meminfo = {}
             for line in f:
                 parts = line.split()
                 if len(parts) >= 2:
-                    meminfo[parts[0].rstrip(':')] = int(parts[1]) * 1024  # KB to bytes
+                    meminfo[parts[0].rstrip(':')] = int(parts[1]) * 1024
             stats["ram_total"] = meminfo.get("MemTotal", 0)
             stats["ram_used"] = stats["ram_total"] - meminfo.get("MemAvailable", 0)
-        
-        # Temperature
+
         thermal_zones = ["/sys/class/thermal/thermal_zone0/temp"]
         for zone in thermal_zones:
             if os.path.exists(zone):
                 with open(zone, 'r') as f:
                     stats["temp"] = int(f.read().strip()) // 1000
                 break
-        
-        # Disks
-        result = subprocess.run(["df", "-B1", "--output=target,size,used"],
+
+        result = subprocess.run(["df", "-B1", "--output=source,target,size,used"],
                                 capture_output=True, text=True, timeout=5)
         for line in result.stdout.strip().split('\n')[1:]:
             parts = line.split()
-            if len(parts) >= 3 and parts[0] in ['/', '/home', '/mnt', '/media']:
-                if int(parts[1]) > 1e9:  # Only show disks > 1GB
-                    stats["disks"].append({
-                        "mount": parts[0],
-                        "total": int(parts[1]),
-                        "used": int(parts[2])
-                    })
-        
-        # Uptime
+            if len(parts) >= 4:
+                source = parts[0]
+                mount = parts[1]
+                if mount in ['/', '/home'] or mount.startswith(('/mnt', '/media', '/srv')):
+                    if int(parts[2]) > 1e9:
+                        dev_name = source.split('/')[-1].rstrip('0123456789')
+                        stats["disks"].append({
+                            "mount": mount,
+                            "total": int(parts[2]),
+                            "used": int(parts[3]),
+                            "device": dev_name
+                        })
+
         with open('/proc/uptime', 'r') as f:
             uptime_seconds = float(f.read().split()[0])
             days = int(uptime_seconds // 86400)
             hours = int((uptime_seconds % 86400) // 3600)
-            if days > 0:
-                stats["uptime"] = f"{days}d {hours}h"
-            else:
-                stats["uptime"] = f"{hours}h"
+            stats["uptime"] = f"{days}d {hours}h" if days > 0 else f"{hours}h"
+
+        stats["disk_smart"] = get_disk_smart_info()
+        stats["container_stats"] = get_container_stats()
+
     except Exception as e:
         print(f"Error getting local stats: {e}")
-    
+
     return stats
 
 # === REMOTE STATS (SSH) ===
 def get_remote_stats(ip, user, port=22):
     """Get stats from remote device via SSH."""
-    try:
-        # Get more meminfo lines for Synology compatibility (no MemAvailable)
-        cmd = "cat /proc/loadavg; echo '---'; cat /proc/meminfo | head -10; echo '---'; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | head -1; echo '---'; df -B1 / | tail -1; echo '---'; cat /proc/uptime; echo '---'; nproc --all"
-        result = subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3",
-             "-p", str(port), f"{user}@{ip}", cmd],
-            capture_output=True, text=True, timeout=10
-        )
+    stats = {"cpu": 0, "ram_used": 0, "ram_total": 0, "temp": None, "disks": [], "uptime": "", "disk_smart": {}, "container_stats": {}}
+    ssh_base = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", "-p", str(port), f"{user}@{ip}"]
 
+    # Basic stats (required)
+    try:
+        cmd = "nproc; echo '---'; cat /proc/loadavg; echo '---'; cat /proc/meminfo | head -10; echo '---'; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | head -1; echo '---'; cat /proc/uptime"
+        result = subprocess.run(ssh_base + [cmd], capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             return None
-
         parts = result.stdout.split('---')
-        stats = {"cpu": 0, "ram_used": 0, "ram_total": 0, "temp": None, "disks": [], "uptime": ""}
 
-        # CPU (load / cpu_count * 100)
-        load = float(parts[0].strip().split()[0])
-        try:
-            remote_cpu_count = int(parts[-1].strip())
-            cpu_count = remote_cpu_count if remote_cpu_count > 0 else 4 # Fallback to 4 if error
-        except ValueError:
-            cpu_count = 4 # Default fallback        
-            
+        cpu_count = int(parts[0].strip()) if parts[0].strip().isdigit() else 4
+        load = float(parts[1].strip().split()[0])
         stats["cpu"] = min(100, int(load / cpu_count * 100))
 
-        # RAM - handle both modern (MemAvailable) and older kernels (MemFree+Buffers+Cached)
         meminfo = {}
-        for line in parts[1].strip().split('\n'):
+        for line in parts[2].strip().split('\n'):
             if ':' in line:
                 key, val = line.split(':')
-                meminfo[key.strip()] = int(val.split()[0]) * 1024  # kB to bytes
-
+                meminfo[key.strip()] = int(val.split()[0]) * 1024
         stats["ram_total"] = meminfo.get("MemTotal", 0)
         if "MemAvailable" in meminfo:
             stats["ram_used"] = stats["ram_total"] - meminfo["MemAvailable"]
         else:
-            # Fallback for older kernels (Synology): Free + Buffers + Cached
             free = meminfo.get("MemFree", 0) + meminfo.get("Buffers", 0) + meminfo.get("Cached", 0)
             stats["ram_used"] = stats["ram_total"] - free
 
-        # Temp
-        temp_str = parts[2].strip()
+        temp_str = parts[3].strip()
         if temp_str.isdigit():
             stats["temp"] = int(temp_str) // 1000
-        
-        # Disk
-        disk_parts = parts[3].strip().split()
-        if len(disk_parts) >= 3:
-            stats["disks"].append({
-                "mount": "/",
-                "total": int(disk_parts[1]),
-                "used": int(disk_parts[2])
-            })
-        
-        # Uptime
+
         uptime_seconds = float(parts[4].strip().split()[0])
         days = int(uptime_seconds // 86400)
         hours = int((uptime_seconds % 86400) // 3600)
         stats["uptime"] = f"{days}d {hours}h" if days > 0 else f"{hours}h"
-        
-        return stats
-    except Exception as e:
-        print(f"Error getting remote stats: {e}")
+    except:
         return None
+
+    # Disks (optional)
+    try:
+        result = subprocess.run(ssh_base + ["df -B1 --output=source,target,size,used 2>/dev/null || df -B1"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n')[1:]:
+                cols = line.split()
+                if len(cols) >= 4:
+                    source, mount = cols[0], cols[1]
+                    if mount in ['/', '/home'] or mount.startswith(('/mnt', '/media', '/srv')):
+                        try:
+                            if int(cols[2]) > 1e9:
+                                stats["disks"].append({"mount": mount, "total": int(cols[2]), "used": int(cols[3])})
+                        except:
+                            pass
+    except:
+        pass
+
+    # SMART (optional)
+    try:
+        result = subprocess.run(ssh_base + ["lsblk -d -n -o NAME,TYPE 2>/dev/null"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            disk_names = []
+            for line in result.stdout.strip().split('\n'):
+                cols = line.split()
+                if len(cols) >= 2 and cols[1] == 'disk':
+                    disk_names.append(cols[0])
+                    stats["disk_smart"][cols[0]] = {"temp": None, "smart": None}
+
+            for dev in disk_names:
+                try:
+                    result = subprocess.run(ssh_base + [f"sudo smartctl -A -H /dev/{dev} 2>/dev/null"], capture_output=True, text=True, timeout=5)
+                    output = result.stdout
+                    if "PASSED" in output:
+                        stats["disk_smart"][dev]["smart"] = "ok"
+                    elif "FAILED" in output:
+                        stats["disk_smart"][dev]["smart"] = "failed"
+                    for line in output.split('\n'):
+                        if 'Temperature' in line and '-' in line:
+                            after_dash = line.split('-')[-1].strip()
+                            first_num = after_dash.split()[0] if after_dash else ''
+                            if first_num.isdigit() and 0 < int(first_num) < 100:
+                                stats["disk_smart"][dev]["temp"] = int(first_num)
+                                break
+                except:
+                    pass
+    except:
+        pass
+
+    # Docker stats (optional)
+    try:
+        result = subprocess.run(ssh_base + ["docker stats --no-stream --format '{{.Name}}:{{.CPUPerc}}:{{.MemPerc}}' 2>/dev/null"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                if ':' in line:
+                    cols = line.split(':')
+                    if len(cols) >= 3:
+                        try:
+                            stats["container_stats"][cols[0]] = {"cpu": float(cols[1].replace('%', '')), "mem": float(cols[2].replace('%', ''))}
+                        except:
+                            pass
+    except:
+        pass
+
+    return stats
 
 # === FOLDER BROWSING ===
 def browse_folder(device, path="/"):
@@ -708,6 +859,78 @@ def ping_host(ip, timeout=1):
     except:
         return False
 
+def get_health_status():
+    """Get health status for all devices and containers (for mobile app polling)."""
+    devices = []
+    containers_running = 0
+    containers_stopped = 0
+
+    for dev in CONFIG.get('devices', []):
+        dev_id = dev.get('id')
+        cached = get_cached_status(dev_id)
+        refresh_device_status_async(dev)
+
+        online = cached.get('online') if cached else None
+        stats = cached.get('stats') if cached else None
+        container_statuses = cached.get('containers', {}) if cached else {}
+
+        device_alerts = dev.get('alerts', {})
+        alerts = {**DEFAULT_ALERTS, **device_alerts}
+
+        # Add container alerts from actual container statuses (all enabled by default)
+        # Merge with any user-configured container alerts
+        if container_statuses:
+            default_container_alerts = {name: True for name in container_statuses.keys()}
+            user_container_alerts = alerts.get('containers', {})
+            alerts['containers'] = {**default_container_alerts, **user_container_alerts}
+
+        device_info = {
+            "id": dev_id,
+            "name": dev.get('name', 'Unknown'),
+            "online": online,
+            "alerts": alerts
+        }
+
+        if stats:
+            device_info["cpu"] = stats.get("cpu", 0)
+            device_info["ram"] = int(stats.get("ram_used", 0) / max(stats.get("ram_total", 1), 1) * 100)
+            device_info["temp"] = stats.get("temp")
+            # Disk usage - max usage across all disks
+            disks = stats.get("disks", [])
+            if disks:
+                max_disk_usage = max(int(d.get("used", 0) / max(d.get("total", 1), 1) * 100) for d in disks)
+                device_info["disk"] = max_disk_usage
+            # SMART status and disk temp
+            disk_smart = stats.get("disk_smart", {})
+            smart_failed = any(s.get("smart") == "failed" for s in disk_smart.values())
+            if smart_failed:
+                device_info["smart_failed"] = True
+            disk_temps = [s.get("temp") for s in disk_smart.values() if s.get("temp") is not None]
+            if disk_temps:
+                device_info["disk_temp"] = max(disk_temps)
+
+        # Container statuses for this device
+        device_containers = {}
+        for name, state in container_statuses.items():
+            device_containers[name] = state
+            if state == 'running':
+                containers_running += 1
+            else:
+                containers_stopped += 1
+        if device_containers:
+            device_info["containers"] = device_containers
+
+        devices.append(device_info)
+
+    return {
+        "devices": devices,
+        "containers": {
+            "running": containers_running,
+            "stopped": containers_stopped
+        },
+        "timestamp": int(time.time())
+    }
+
 def send_wol(mac, broadcast="255.255.255.255"):
     try:
         mac = mac.replace(":", "").replace("-", "").upper()
@@ -1053,7 +1276,7 @@ HTML_PAGE = '''<!DOCTYPE html>
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="mobile-web-app-capable" content="yes">
-    <meta name="theme-color" content="#0a0a0f">
+    <meta name="theme-color" content="#0a0a0a">
     <meta name="application-name" content="DeQ">
     <meta name="apple-mobile-web-app-title" content="DeQ">
     <title>DeQ</title>
@@ -1080,7 +1303,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             --bg-tertiary: #1a1a1a;
             --border: #2b2b2b;
             --text-primary: #e0e0e0;
-            --text-secondary: #8a8a8a;
+            --text-secondary: #b6b6b6;
             --accent: #2ed573;
             --accent-muted: rgba(46, 213, 115, 0.6);
             --danger: #ff4757;
@@ -1720,6 +1943,146 @@ HTML_PAGE = '''<!DOCTYPE html>
         .device-stats-bars.show-values .stat-value {
             display: block;
         }
+
+        .stats-modal-btn {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 4px;
+            margin-left: 4px;
+            opacity: 0.5;
+            transition: opacity 0.15s, color 0.15s;
+        }
+
+        .stats-modal-btn:hover {
+            opacity: 1;
+            color: var(--accent);
+        }
+
+        .stats-modal-btn i {
+            width: 16px;
+            height: 16px;
+        }
+
+        /* Stats Modal */
+        .stats-section {
+            margin-bottom: 20px;
+        }
+
+        .stats-section:last-child {
+            margin-bottom: 0;
+        }
+
+        .stats-section-title {
+            font-size: 11px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .stats-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+        }
+
+        .stats-table th {
+            text-align: left;
+            padding: 6px 8px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            font-size: 11px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .stats-table td {
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .stats-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .stats-table th:nth-child(1) { width: 30%; }
+        .stats-table th:nth-child(2) { width: 35%; }
+        .stats-table th:nth-child(3) { width: 15%; text-align: center; }
+        .stats-table th:nth-child(4) { width: 20%; }
+
+        .stats-table td:nth-child(3) { text-align: center; }
+
+        .stats-table input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            -webkit-appearance: none;
+            appearance: none;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .stats-table input[type="checkbox"]:checked {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .stats-table input[type="checkbox"]:checked::after {
+            content: '';
+            position: absolute;
+            left: 4px;
+            top: 1px;
+            width: 5px;
+            height: 9px;
+            border: solid var(--bg-primary);
+            border-width: 0 2px 2px 0;
+            transform: rotate(45deg);
+        }
+
+        .container-stats-inline {
+            color: var(--text-secondary);
+            font-size: 10px;
+            margin-left: 6px;
+            white-space: nowrap;
+        }
+
+        @media (max-width: 500px) {
+            .container-stats-inline {
+                display: block;
+                margin-left: 0;
+                margin-top: 2px;
+            }
+        }
+
+        .stats-table input[type="number"] {
+            width: 55px;
+            padding: 3px 6px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-primary);
+            font-size: 11px;
+        }
+
+        .stats-table input[type="number"]:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .stats-value {
+            font-family: monospace;
+        }
+
+        .stats-value.ok { color: var(--accent); }
+        .stats-value.warn { color: var(--warning); }
+        .stats-value.error { color: var(--danger); }
+
+        .ok { color: var(--accent); }
+        .error { color: var(--danger); }
 
         /* Status indicator (dot + uptime) */
         .device-status-indicator {
@@ -2378,7 +2741,11 @@ HTML_PAGE = '''<!DOCTYPE html>
             font-size: 11px;
             color: var(--text-secondary);
             border-bottom: 1px solid var(--border);
-            word-break: break-all;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            direction: rtl;
+            text-align: left;
         }
 
         .folder-browser-filter {
@@ -3096,43 +3463,43 @@ HTML_PAGE = '''<!DOCTYPE html>
                 <div class="theme-group">
                     <label class="theme-label">Background</label>
                     <div class="theme-color-input">
-                        <input type="color" id="theme-bg" value="#0a0a0f">
-                        <input type="text" class="theme-hex" id="theme-bg-hex" value="#0a0a0f" maxlength="7">
+                        <input type="color" id="theme-bg">
+                        <input type="text" class="theme-hex" id="theme-bg-hex" maxlength="7">
                     </div>
                 </div>
                 <div class="theme-group">
                     <label class="theme-label">Cards</label>
                     <div class="theme-color-input">
-                        <input type="color" id="theme-cards" value="#12121a">
-                        <input type="text" class="theme-hex" id="theme-cards-hex" value="#12121a" maxlength="7">
+                        <input type="color" id="theme-cards">
+                        <input type="text" class="theme-hex" id="theme-cards-hex" maxlength="7">
                     </div>
                 </div>
                 <div class="theme-group">
                     <label class="theme-label">Border</label>
                     <div class="theme-color-input">
-                        <input type="color" id="theme-border" value="#2a2a3a">
-                        <input type="text" class="theme-hex" id="theme-border-hex" value="#2a2a3a" maxlength="7">
+                        <input type="color" id="theme-border">
+                        <input type="text" class="theme-hex" id="theme-border-hex" maxlength="7">
                     </div>
                 </div>
                 <div class="theme-group">
                     <label class="theme-label">Text</label>
                     <div class="theme-color-input">
-                        <input type="color" id="theme-text" value="#e0e0e0">
-                        <input type="text" class="theme-hex" id="theme-text-hex" value="#e0e0e0" maxlength="7">
+                        <input type="color" id="theme-text">
+                        <input type="text" class="theme-hex" id="theme-text-hex" maxlength="7">
                     </div>
                 </div>
                 <div class="theme-group">
                     <label class="theme-label">Text Muted</label>
                     <div class="theme-color-input">
-                        <input type="color" id="theme-text-muted" value="#808090">
-                        <input type="text" class="theme-hex" id="theme-text-muted-hex" value="#808090" maxlength="7">
+                        <input type="color" id="theme-text-muted">
+                        <input type="text" class="theme-hex" id="theme-text-muted-hex" maxlength="7">
                     </div>
                 </div>
                 <div class="theme-group">
                     <label class="theme-label">Accent</label>
                     <div class="theme-color-input">
-                        <input type="color" id="theme-accent" value="#2ed573">
-                        <input type="text" class="theme-hex" id="theme-accent-hex" value="#2ed573" maxlength="7">
+                        <input type="color" id="theme-accent">
+                        <input type="text" class="theme-hex" id="theme-accent-hex" maxlength="7">
                     </div>
                 </div>
             </div>
@@ -3640,6 +4007,89 @@ HTML_PAGE = '''<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Device Stats Modal -->
+    <div class="modal" id="stats-modal">
+        <div class="modal-content" style="max-width: 700px;">
+            <div class="modal-header">
+                <span class="modal-title" id="stats-modal-title">Device Stats</span>
+                <button class="modal-close" onclick="closeModal('stats-modal')">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+            <div id="stats-modal-content">
+                <div id="stats-loading" style="text-align: center; padding: 40px;">
+                    <div class="container-spinner active" style="width: 24px; height: 24px; margin: 0 auto;"></div>
+                    <p style="margin-top: 16px; color: var(--text-secondary);">Loading stats...</p>
+                </div>
+                <div id="stats-data" style="display: none;">
+                    <div class="stats-section">
+                        <div class="stats-section-title">Hardware</div>
+                        <table class="stats-table">
+                            <thead>
+                                <tr>
+                                    <th>Stat</th>
+                                    <th>Value</th>
+                                    <th>Alert</th>
+                                    <th>Event</th>
+                                </tr>
+                            </thead>
+                            <tbody id="stats-hardware"></tbody>
+                        </table>
+                    </div>
+                    <div class="stats-section" id="stats-mounts-section">
+                        <div class="stats-section-title">Mounts</div>
+                        <table class="stats-table">
+                            <thead>
+                                <tr>
+                                    <th>Mount</th>
+                                    <th>Usage</th>
+                                    <th>Alert</th>
+                                    <th>Event</th>
+                                </tr>
+                            </thead>
+                            <tbody id="stats-mounts"></tbody>
+                        </table>
+                    </div>
+                    <div class="stats-section" id="stats-disks-section">
+                        <div class="stats-section-title">Disks</div>
+                        <table class="stats-table">
+                            <thead>
+                                <tr>
+                                    <th>Disk</th>
+                                    <th>Prop</th>
+                                    <th>Value</th>
+                                    <th>Alert</th>
+                                    <th>Event</th>
+                                </tr>
+                            </thead>
+                            <tbody id="stats-disks"></tbody>
+                        </table>
+                    </div>
+                    <div class="stats-section" id="stats-containers-section">
+                        <div class="stats-section-title">Containers</div>
+                        <table class="stats-table">
+                            <thead>
+                                <tr>
+                                    <th>Container</th>
+                                    <th>Status</th>
+                                    <th>On Exit</th>
+                                </tr>
+                            </thead>
+                            <tbody id="stats-containers"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('stats-modal')">Cancel</button>
+                <button type="button" class="btn" onclick="saveStatsConfig()">Save</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Docker Scan Modal -->
     <div class="modal" id="docker-scan-modal">
         <div class="modal-content" style="max-width: 500px;">
@@ -3865,7 +4315,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             cards: '#151515',
             border: '#2b2b2b',
             text: '#e0e0e0',
-            textMuted: '#808090',
+            textMuted: '#808080',
             accent: '#2ed573',
             glass: 0,
             blur: 0,
@@ -4321,6 +4771,9 @@ HTML_PAGE = '''<!DOCTYPE html>
                                 <span class="stat-value">${s.temp}°</span>
                             </div>
                             ` : ''}
+                            <button class="stats-modal-btn" onclick="event.stopPropagation(); openStatsModal('${dev.id}')" title="Device Stats">
+                                <i data-lucide="square-activity"></i>
+                            </button>
                         </div>
                     ` : ''}
                     ${actions.length || containersToggle ? `
@@ -4732,7 +5185,235 @@ HTML_PAGE = '''<!DOCTYPE html>
             const device = config.devices.find(d => d.id === id);
             if (device) openDeviceModal(device);
         }
-        
+
+        // === Stats Modal ===
+        let currentStatsDeviceId = null;
+
+        async function openStatsModal(deviceId) {
+            currentStatsDeviceId = deviceId;
+            const device = config.devices.find(d => d.id === deviceId);
+            if (!device) return;
+
+            document.getElementById('stats-modal-title').textContent = device.name;
+            document.getElementById('stats-loading').style.display = 'block';
+            document.getElementById('stats-data').style.display = 'none';
+            openModal('stats-modal');
+
+            const res = await api(`device/${deviceId}/stats`);
+            if (res.success) {
+                renderStatsModal(device, res.stats, res.online);
+            }
+        }
+
+        function renderStatsModal(device, stats, isOnline) {
+            const alerts = device.alerts || {};
+
+            // Hardware section
+            const hwBody = document.getElementById('stats-hardware');
+            const ramPercent = stats.ram_total ? Math.round(stats.ram_used / stats.ram_total * 100) : 0;
+            hwBody.innerHTML = `
+                <tr>
+                    <td>Online</td>
+                    <td><span class="status-dot ${isOnline ? 'online' : 'offline'}"></span> ${isOnline ? 'Online' : 'Offline'}</td>
+                    <td><input type="checkbox" data-alert="online" ${alerts.online !== false ? 'checked' : ''}></td>
+                    <td><span style="color: var(--text-secondary); font-size: 11px;">On Change</span></td>
+                </tr>
+                <tr>
+                    <td>CPU Load</td>
+                    <td>${stats.cpu || 0}%</td>
+                    <td><input type="checkbox" data-alert="cpu" ${alerts.cpu ? 'checked' : ''}></td>
+                    <td><input type="number" data-threshold="cpu" value="${alerts.cpu || ''}" placeholder="%" min="1" max="100"></td>
+                </tr>
+                <tr>
+                    <td>CPU Temp</td>
+                    <td>${stats.temp ? stats.temp + '°C' : '-'}</td>
+                    <td><input type="checkbox" data-alert="cpu_temp" ${alerts.cpu_temp ? 'checked' : ''}></td>
+                    <td><input type="number" data-threshold="cpu_temp" value="${alerts.cpu_temp || ''}" placeholder="°C" min="1" max="120"></td>
+                </tr>
+                <tr>
+                    <td>RAM Usage</td>
+                    <td>${ramPercent}%</td>
+                    <td><input type="checkbox" data-alert="ram" ${alerts.ram ? 'checked' : ''}></td>
+                    <td><input type="number" data-threshold="ram" value="${alerts.ram || ''}" placeholder="%" min="1" max="100"></td>
+                </tr>
+            `;
+
+            // Mounts section
+            const mountsBody = document.getElementById('stats-mounts');
+            const mountsSection = document.getElementById('stats-mounts-section');
+            const diskAlerts = alerts.disks || {};
+
+            if (stats.disks && stats.disks.length > 0) {
+                mountsSection.style.display = 'block';
+                mountsBody.innerHTML = stats.disks.map(disk => {
+                    const usage = Math.round(disk.used / disk.total * 100);
+                    const mountAlerts = diskAlerts[disk.mount] || {};
+                    const usageThreshold = mountAlerts.usage ?? alerts.disk_usage ?? '';
+                    const shortMount = disk.mount.length > 20 ? '...' + disk.mount.slice(-17) : disk.mount;
+                    return `
+                        <tr>
+                            <td title="${disk.mount}">${shortMount}</td>
+                            <td>${usage}%</td>
+                            <td><input type="checkbox" data-alert="disk_usage_${disk.mount}" ${usageThreshold ? 'checked' : ''}></td>
+                            <td><input type="number" data-threshold="disk_usage_${disk.mount}" value="${usageThreshold}" placeholder="%" min="1" max="100"></td>
+                        </tr>
+                    `;
+                }).join('');
+            } else {
+                mountsSection.style.display = 'none';
+            }
+
+            // Disks section (physical disks with SMART)
+            const disksBody = document.getElementById('stats-disks');
+            const disksSection = document.getElementById('stats-disks-section');
+            const diskSmart = stats.disk_smart || {};
+            let diskRows = '';
+
+            Object.entries(diskSmart).forEach(([devName, smart]) => {
+                if (!smart.temp && !smart.smart) return;
+                const devAlerts = diskAlerts[devName] || {};
+                const hasTemp = smart.temp !== null && smart.temp !== undefined;
+                const hasSmart = smart.smart;
+                const tempThreshold = devAlerts.temp ?? alerts.disk_temp ?? '';
+
+                diskRows += `<tr>
+                    <td>/dev/${devName}</td>
+                    <td>Temp</td>
+                    <td>${hasTemp ? smart.temp + '°C' : '-'}</td>
+                    <td>${hasTemp ? `<input type="checkbox" data-alert="disk_temp_${devName}" ${tempThreshold ? 'checked' : ''}>` : ''}</td>
+                    <td>${hasTemp ? `<input type="number" data-threshold="disk_temp_${devName}" value="${tempThreshold}" placeholder="°C" min="1" max="80" style="width:50px">` : ''}</td>
+                </tr>
+                <tr>
+                    <td></td>
+                    <td>SMART</td>
+                    <td>${hasSmart ? `<span class="${smart.smart === 'ok' ? 'ok' : 'error'}">${smart.smart.toUpperCase()}</span>` : '-'}</td>
+                    <td>${hasSmart ? `<input type="checkbox" data-alert="disk_smart_${devName}" ${devAlerts.smart !== false ? 'checked' : ''}>` : ''}</td>
+                    <td>${hasSmart ? `<span style="color: var(--text-secondary); font-size: 11px;">On Fail</span>` : ''}</td>
+                </tr>`;
+            });
+
+            if (diskRows) {
+                disksSection.style.display = 'block';
+                disksBody.innerHTML = diskRows;
+            } else {
+                disksSection.style.display = 'none';
+            }
+
+            // Containers section
+            const containersBody = document.getElementById('stats-containers');
+            const containersSection = document.getElementById('stats-containers-section');
+            const cached = deviceStats[device.id];
+            const containerStatuses = cached?.containers || {};
+            const containerStats = stats.container_stats || {};
+            const containers = device.docker?.containers || [];
+
+            if (containers.length > 0) {
+                containersSection.style.display = 'block';
+                containersBody.innerHTML = containers.map(c => {
+                    const name = typeof c === 'string' ? c : c.name;
+                    const status = containerStatuses[name] || 'unknown';
+                    const isRunning = status === 'running';
+                    const cStats = containerStats[name];
+                    const containerAlerts = alerts.containers?.[name];
+
+                    let statsHtml = '';
+                    if (cStats && isRunning) {
+                        statsHtml = `<span class="container-stats-inline">${cStats.cpu.toFixed(1)}% CPU · ${cStats.mem.toFixed(1)}% RAM</span>`;
+                    }
+
+                    return `
+                        <tr>
+                            <td>${name}</td>
+                            <td><span class="status-dot ${isRunning ? 'online' : 'offline'}"></span> ${status}${statsHtml}</td>
+                            <td><input type="checkbox" data-alert="container_${name}" ${containerAlerts !== false ? 'checked' : ''}></td>
+                        </tr>
+                    `;
+                }).join('');
+            } else {
+                containersSection.style.display = 'none';
+            }
+
+            document.getElementById('stats-loading').style.display = 'none';
+            document.getElementById('stats-data').style.display = 'block';
+        }
+
+        async function saveStatsConfig() {
+            const device = config.devices.find(d => d.id === currentStatsDeviceId);
+            if (!device) return;
+
+            // Validate: alert enabled but no threshold
+            const errors = [];
+            document.querySelectorAll('[data-alert]').forEach(checkbox => {
+                if (!checkbox.checked) return;
+                const key = checkbox.dataset.alert;
+                if (key === 'online' || key.startsWith('disk_smart_') || key.startsWith('container_')) return;
+                const input = document.querySelector(`[data-threshold="${key}"]`);
+                if (input && !input.value) {
+                    errors.push(key.replace(/_/g, ' ').replace('disk usage ', '').replace('disk temp ', ''));
+                }
+            });
+            if (errors.length > 0) {
+                showToast('Missing threshold for: ' + errors.join(', '), true);
+                return;
+            }
+
+            const alerts = {
+                online: document.querySelector('[data-alert="online"]')?.checked ?? true,
+                cpu: getThresholdValue('cpu'),
+                cpu_temp: getThresholdValue('cpu_temp'),
+                ram: getThresholdValue('ram'),
+                disks: {},
+                containers: {}
+            };
+
+            // Collect disk usage thresholds (by mount)
+            document.querySelectorAll('[data-threshold^="disk_usage_"]').forEach(input => {
+                const mount = input.dataset.threshold.replace('disk_usage_', '');
+                const checkbox = document.querySelector(`[data-alert="disk_usage_${mount}"]`);
+                if (!alerts.disks[mount]) alerts.disks[mount] = {};
+                if (checkbox?.checked && input.value) {
+                    alerts.disks[mount].usage = parseInt(input.value);
+                }
+            });
+
+            // Collect disk temp thresholds (by device)
+            document.querySelectorAll('[data-threshold^="disk_temp_"]').forEach(input => {
+                const dev = input.dataset.threshold.replace('disk_temp_', '');
+                const checkbox = document.querySelector(`[data-alert="disk_temp_${dev}"]`);
+                if (!alerts.disks[dev]) alerts.disks[dev] = {};
+                if (checkbox?.checked && input.value) {
+                    alerts.disks[dev].temp = parseInt(input.value);
+                }
+            });
+
+            // Collect disk SMART alerts (by device)
+            document.querySelectorAll('[data-alert^="disk_smart_"]').forEach(checkbox => {
+                const dev = checkbox.dataset.alert.replace('disk_smart_', '');
+                if (!alerts.disks[dev]) alerts.disks[dev] = {};
+                alerts.disks[dev].smart = checkbox.checked;
+            });
+
+            // Collect container alerts
+            document.querySelectorAll('[data-alert^="container_"]').forEach(checkbox => {
+                const name = checkbox.dataset.alert.replace('container_', '');
+                alerts.containers[name] = checkbox.checked;
+            });
+
+            device.alerts = alerts;
+            await api('config', 'POST', { config });
+            closeModal('stats-modal');
+            showToast('Alert settings saved');
+        }
+
+        function getThresholdValue(key) {
+            const checkbox = document.querySelector(`[data-alert="${key}"]`);
+            const input = document.querySelector(`[data-threshold="${key}"]`);
+            if (checkbox?.checked && input?.value) {
+                return parseInt(input.value);
+            }
+            return null;
+        }
+
         // === Tasks ===
         let wizardStep = 1;
 
@@ -4779,10 +5460,10 @@ HTML_PAGE = '''<!DOCTYPE html>
                     </div>
                     <div class="task-actions">
                         <button class="task-btn" onclick="toggleTask('${task.id}')" ${isRunning ? 'disabled' : ''}>
-                            ${task.enabled ? '⏸ Pause' : '▶ Resume'}
+                            ${task.enabled ? '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> Pause' : '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Resume'}
                         </button>
                         <button class="task-btn" onclick="runTaskNow('${task.id}')" ${isRunning ? 'disabled' : ''}>
-                            ${isRunning ? 'Running...' : '▷ Run Now'}
+                            ${isRunning ? 'Running...' : '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Run Now'}
                         </button>
                     </div>
                     <div class="task-edit" onclick="editTask('${task.id}')">
@@ -4835,19 +5516,12 @@ HTML_PAGE = '''<!DOCTYPE html>
             const now = new Date();
             const time = date.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
 
-            // Same day
-            if (date.toDateString() === now.toDateString()) {
-                return time;
-            }
+            const dateDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            const diffDays = Math.round((today - dateDay) / (1000 * 60 * 60 * 24));
 
-            // Yesterday
-            const yesterday = new Date(now);
-            yesterday.setDate(yesterday.getDate() - 1);
-            if (date.toDateString() === yesterday.toDateString()) {
-                return `Yesterday ${time}`;
-            }
-
-            // Older - show date
+            if (diffDays === 0) return time;
+            if (diffDays === 1) return `Yesterday ${time}`;
             return date.toLocaleDateString('de-DE', { day: '2-digit', month: '2-digit' }) + ' ' + time;
         }
 
@@ -6258,8 +6932,8 @@ MANIFEST_JSON = json.dumps({
     "description": "Homelab Dashboard",
     "start_url": "/",
     "display": "standalone",
-    "background_color": "#0a0a0f",
-    "theme_color": "#0a0a0f",
+    "background_color": "#0a0a0a",
+    "theme_color": "#0a0a0a",
     "orientation": "any",
     "icons": [
         {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
@@ -6268,7 +6942,7 @@ MANIFEST_JSON = json.dumps({
 
 # Icon
 ICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="96" fill="#222"/>
+  <rect width="512" height="512" fill="#0a0a0a"/>
   <!-- D -->
   <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="#e0e0e0" stroke-width="16"/>
   <!-- e -->
@@ -6609,13 +7283,22 @@ class TaskScheduler:
                 time.sleep(1)
 
     def _update_next_runs(self):
-        """Update next_run times for all tasks."""
+        """Update next_run times for all tasks, preserving valid future times."""
         global CONFIG
         changed = False
+        now = datetime.now()
         for task in CONFIG.get('tasks', []):
             if task.get('enabled', True):
+                current_next = task.get('next_run')
+                if current_next:
+                    try:
+                        next_dt = datetime.fromisoformat(current_next)
+                        if next_dt > now:
+                            continue
+                    except:
+                        pass
                 next_run = calculate_next_run(task)
-                if next_run != task.get('next_run'):
+                if next_run != current_next:
                     task['next_run'] = next_run
                     changed = True
         if changed:
@@ -6694,7 +7377,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         
         if path == '/manifest.json':
-            self.send_file(MANIFEST_JSON, 'application/json')
+            self.send_file(MANIFEST_JSON, 'application/manifest+json')
             return
         
         if path == '/icon.svg':
@@ -6723,11 +7406,20 @@ class RequestHandler(BaseHTTPRequestHandler):
             api_path = path[5:].split('?')[0]
             
             if api_path == 'config':
-                self.send_json({"success": True, "config": CONFIG, "running_tasks": list(running_tasks.keys())})
+                self.send_json({"success": True, "config": get_config_with_defaults(), "running_tasks": list(running_tasks.keys())})
                 return
             
             if api_path == 'stats/host':
                 self.send_json({"success": True, "stats": get_local_stats()})
+                return
+
+            if api_path == 'health':
+                health = get_health_status()
+                self.send_json(health)
+                return
+
+            if api_path == 'version':
+                self.send_json({"version": "0.9.1", "name": "DeQ"})
                 return
 
             if api_path == 'network/scan':
@@ -6773,20 +7465,28 @@ class RequestHandler(BaseHTTPRequestHandler):
                         return
 
                     if action == 'status':
-                        container_statuses = get_all_container_statuses(dev)
+                        cached = get_cached_status(dev_id)
+                        refresh_device_status_async(dev)
+                        if cached:
+                            self.send_json({"success": True, **cached})
+                        else:
+                            self.send_json({"success": True, "online": None, "stats": None, "containers": {}})
+                        return
 
+                    if action == 'stats':
                         if dev.get('is_host'):
                             stats = get_local_stats()
-                            self.send_json({"success": True, "online": True, "stats": stats, "containers": container_statuses})
-                            return
-
-                        online = ping_host(dev['ip'])
-                        stats = None
-                        if online and dev.get('ssh', {}).get('user'):
-                            stats = get_remote_stats(dev['ip'], dev['ssh']['user'], dev['ssh'].get('port', 22))
-                        self.send_json({"success": True, "online": online, "stats": stats, "containers": container_statuses})
+                            online = True
+                        else:
+                            online = ping_host(dev.get('ip', ''))
+                            ssh = dev.get('ssh', {})
+                            if online and ssh.get('user'):
+                                stats = get_remote_stats(dev['ip'], ssh['user'], ssh.get('port', 22))
+                            else:
+                                stats = None
+                        self.send_json({"success": True, "stats": stats or {}, "online": online})
                         return
-                    
+
                     if action == 'wake':
                         if dev.get('wol', {}).get('mac'):
                             result = send_wol(dev['wol']['mac'], dev['wol'].get('broadcast', '255.255.255.255'))
