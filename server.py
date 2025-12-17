@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-DeQ - Alles schläft, einer wacht.
+DeQ - less > more
 A mighty pocket rocket for your homelab. Breaking conventions - single file, no Docker, raw control.
 Control devices, view stats, manage links and files - all in one place.
 USE BEHIND VPN ONLY! DO NOT EXPOSE TO PUBLIC INTERNET!
-
 """
 
 import subprocess
@@ -23,7 +22,7 @@ DEFAULT_PORT = 5050
 DATA_DIR = "/opt/deq"
 CONFIG_FILE = f"{DATA_DIR}/config.json"
 HISTORY_DIR = f"{DATA_DIR}/history"
-VERSION = "0.9.5"
+VERSION = "0.9.6"
 
 # === DEFAULT CONFIG ===
 DEFAULT_ALERTS = {"online": True, "cpu": 90, "ram": 90, "cpu_temp": 80, "disk_usage": 90, "disk_temp": 60, "smart": True}
@@ -922,12 +921,25 @@ def get_health_status():
 
         devices.append(device_info)
 
+    # Task statuses
+    tasks = []
+    for task in CONFIG.get('tasks', []):
+        if task.get('last_status'):
+            tasks.append({
+                "id": task.get('id'),
+                "name": task.get('name', 'Unknown'),
+                "status": task.get('last_status'),
+                "error": task.get('last_error'),
+                "last_run": task.get('last_run')
+            })
+
     return {
         "devices": devices,
         "containers": {
             "running": containers_running,
             "stopped": containers_stopped
         },
+        "tasks": tasks,
         "timestamp": int(time.time())
     }
 
@@ -6639,8 +6651,12 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         function startPolling() {
             loadDeviceStatus();
+            renderTasks();
             if (!deviceInterval) {
-                deviceInterval = setInterval(loadDeviceStatus, 10000);
+                deviceInterval = setInterval(() => {
+                    loadDeviceStatus();
+                    renderTasks();
+                }, 10000);
             }
         }
 
