@@ -1,4 +1,5 @@
 # DeQ
+<p align="center">Rethinking homelab tools. Less complexity, more control.</p>
 
 <p align="center">A bare-metal admin deck with native Android companion app.<br>
 Full file manager. Task and Backup scheduling. Container control. Push alerts to your phone.</p>
@@ -10,7 +11,7 @@ One Python file. 300KB. 20MB RAM.</p>
 
 ![DeQ Hero](assets/DeQ-Hero.jpg)
 
-**Website:** [deq.rocks](https://deq.rocks) · **FAQ:** [deq.rocks/faq](https://deq.rocks/faq.html) · **Support:** [Patreon](https://patreon.com/deqrocks)
+**Website:** [deq.rocks](https://deq.rocks) · **FAQ:** [deq.rocks/faq](https://deq.rocks/faq.html) · **Reddit:** [r/LowPowerHomelab](https://www.reddit.com/r/LowPowerHomelab/) · **Support:** [Patreon](https://patreon.com/deqrocks)
 
 ## Concept
 
@@ -56,7 +57,7 @@ The installer asks a few questions (IP, port) and gives you your access URL.
 <p align="center"><img src="assets/DeQ-Onboarding-Devices.jpg" width="700"></p>
 
 1. Open your DeQ URL in a browser (like 192.168.1.1:5050)
-2. Follow the onboarding dialog to scan your network for devices and containers
+2. Follow the onboarding wizard to scan your network for devices and containers
 3. Click the pencil icon to edit existing items or to add devices manually
 4. Add links and notes - assign icons
 5. Drag links or devices to reorder them
