@@ -3,7 +3,7 @@
 ## <p align="center">A bare-metal admin deck with native Android companion app<br>
 
 - Full file manager. Task and Backup scheduling. Container control. Push alerts to your phone
-- Vanilla code. No dependencies. One Python file 300KB. 20MB RAM
+- Vanilla code. No dependencies. One Python file 350KB. 20MB RAM
 
 
 ![DeQ Hero](assets/DeQ-Hero.jpg)
@@ -22,7 +22,8 @@
 
 - **Android Companion app** - free app for your smartphone to manage your servers or get notified when things go wrong
 - **Device Control** - Wake-on-LAN, shutdown, suspend, Docker start/stop
-- **Scheduled Tasks** - Automated backups, wake and shutdown
+- **Scheduled Tasks** - Automated backups, wake, shutdown, suspend, and scripts
+- **Scripts** - Run shell scripts from the dashboard or on a schedule
 - **File Manager** - Dual-pane file browser, copy/move/upload between devices
 - **System Stats** - CPU, RAM, temperature, disk usage
 - **Quick Links** - Bookmarks to your services with custom icons (Lucide or Dashboard Icons)
@@ -57,7 +58,7 @@ When your Docker daemon crashes, when an update borks the container network, whe
 
 **Yes, it runs as root. Here's why that's okay.**
 
-The security model is "trusted tool on a trusted network." DeQ assumes you're behind a VPN (Tailscale, WireGuard). The code is auditable - all 300KB of it. A technically competent user can read exactly what DeQ does in an afternoon. Compare that to trusting a 200MB Docker image with layers of abstraction you'll never inspect.
+The security model is "trusted tool on a trusted network." DeQ assumes you're behind a VPN (Tailscale, WireGuard). The code is auditable - all 350KB of it. A technically competent user can read exactly what DeQ does in an afternoon. Compare that to trusting a 200MB Docker image with layers of abstraction you'll never inspect.
 
 - Never expose DeQ to the public internet
 - Use Tailscale, WireGuard, or another VPN for remote access
@@ -166,18 +167,55 @@ This grants access only to power commands and disk health monitoring, nothing el
 
 ## Remote Access
 
-DeQ has no built-in authentication. For secure remote access, use [Tailscale](https://tailscale.com) or another VPN. Access DeQ via your Tailscale IP.
+For secure remote access, use [Tailscale](https://tailscale.com) or another VPN. Access DeQ via your Tailscale IP.
+
+### Admin Password (optional)
+
+Protect your dashboard with a password:
+
+```bash
+# Set or change password
+sudo ./install.sh --set-password
+
+# Remove password (disable auth)
+sudo ./install.sh --remove-password
+```
+
+When set, a login screen appears before accessing the dashboard. Sessions persist until logout or password change.
 
 ## Scheduled Tasks
 <p align="center"><img src="assets/DeQ-Task-Wizard.jpg" width="700"></p>
 
 DeQ can run tasks automatically:
 
-- **Wake** - Power on a device or start a Docker container
-- **Shutdown** - Power off a device or stop a Docker container
+- **Power On** - Wake a device (WoL) or start a Docker container
+- **Power Off** - Shutdown a device (SSH) or stop a Docker container
+- **Suspend** - Put a device to sleep (devices only)
 - **Backup** - Sync files between devices using rsync
+- **Script** - Run a shell script from `/opt/deq/scripts/`
 
 Example workflow: Wake your NAS at 3 AM, run a backup from your main server, shut it down when done.
+
+## Scripts
+
+Run shell scripts directly from the dashboard. Place executable scripts in `/opt/deq/scripts/` and they appear in the Scripts section.
+
+```bash
+# Example: Create a simple script
+sudo mkdir -p /opt/deq/scripts
+sudo nano /opt/deq/scripts/docker-prune.sh
+```
+
+```bash
+#!/bin/bash
+docker system prune -af
+```
+
+```bash
+sudo chmod +x /opt/deq/scripts/docker-prune.sh
+```
+
+In edit mode, click the scan button in the Scripts section to discover new scripts. Scripts can also be scheduled as tasks.
 
 ## File Manager
 <p align="center"><img src="assets/DeQ-File-Manager.jpg" width="700"></p>
@@ -191,11 +229,22 @@ Click the folder icon (top right) to open the dual-pane file manager. Browse fil
 - Create new Folders
 - Create zip archives (or tar.gz as fallback)
 - Download individual files
+- Progress indicator with speed and ETA
+- Preflight checks (verifies free space before transfer)
+- Remembers your last folder per device
 
 **Navigation:**
 - Click to select (single pane only)
 - Double-click to open folders
 - Drag files from your desktop to upload
+
+**How transfers work:**
+
+| Transfer type | How it works |
+|---------------|--------------|
+| Host ↔ Remote | Direct rsync over SSH |
+| Same device | Direct copy on that device (no network transfer) |
+| Remote ↔ Remote | Routes through host (download then upload). Preflight checks free space on host. |
 
 ## Theming
 
