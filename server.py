@@ -35,7 +35,7 @@ SCRIPTS_DIR = f"{DATA_DIR}/scripts"
 PASSWORD_FILE = f"{DATA_DIR}/.password"
 SESSION_SECRET_FILE = f"{DATA_DIR}/.session_secret"
 SESSION_COOKIE_NAME = "deq_session"
-VERSION = "0.9.8"
+VERSION = "0.9.9"
 
 # SSH ControlMaster for connection reuse (reduces overhead when File Manager makes many SSH calls)
 SSH_CONTROL_OPTS = ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/deq-ssh-%r@%h:%p", "-o", "ControlPersist=60", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2"]
@@ -1264,7 +1264,8 @@ def get_health_status():
             "id": dev_id,
             "name": dev.get('name', 'Unknown'),
             "online": online,
-            "alerts": alerts
+            "alerts": alerts,
+            "is_host": dev.get('is_host', False)
         }
 
         if stats:
@@ -2158,6 +2159,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
             gap: 12px;
+            align-items: start;
         }
 
         .device-card {
@@ -5445,7 +5447,7 @@ HTML_PAGE = '''<!DOCTYPE html>
 
                     // Toggle button for actions row
                     containersToggle = `
-                        <span class="containers-toggle" onclick="event.stopPropagation(); toggleContainers(event, '${dev.id}')">
+                        <span class="containers-toggle" onclick="event.stopPropagation(); toggleContainers('${dev.id}')">
                             <span class="containers-summary" style="${isExpanded ? 'display: none;' : ''}">
                                 ${runningCount > 0 ? `<span>${runningCount}</span><span class="status-dot online"></span>` : ''}
                                 ${stoppedCount > 0 ? `<span>${stoppedCount}</span><span class="status-dot offline"></span>` : ''}
@@ -5553,14 +5555,14 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
 
         // === Container Accordion ===
-        async function toggleContainers(e, deviceId) {
+        async function toggleContainers(deviceId) {
             // Toggle accordion state
             if (!config.settings.accordion) config.settings.accordion = {};
             const currentState = config.settings.accordion[deviceId] !== false;
             config.settings.accordion[deviceId] = !currentState;
 
-            // Update UI immediately - use event target to find the correct card
-            const card = e.target.closest('.device-card');
+            // Update UI
+            const card = document.querySelector(`.device-card[data-id="${deviceId}"]`);
             if (card) {
                 const summary = card.querySelector('.containers-summary');
                 const chevron = card.querySelector('.containers-chevron');
@@ -7573,7 +7575,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 deviceInterval = setInterval(() => {
                     loadDeviceStatus();
                     renderTasks();
-                }, 10000);
+                }, 5000);
             }
         }
 
@@ -8384,7 +8386,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
 
             if api_path == 'version':
-                self.send_json({"version": "0.9.1", "name": "DeQ"})
+                self.send_json({"version": VERSION, "name": "DeQ"})
                 return
 
             if api_path == 'network/scan':
