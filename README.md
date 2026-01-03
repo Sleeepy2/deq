@@ -1,6 +1,6 @@
 # DeQ
 
-## <p align="center">A bare-metal admin deck with native Android companion app<br>
+## <p align="center">A bare-metal homelab control plane with native Android companion app<br>
 
 - Full file manager. Task and Backup scheduling. Container control. Push alerts to your phone
 - Vanilla code. No dependencies. One Python file 350KB. 20MB RAM
@@ -11,7 +11,7 @@
 **Website:** [deq.rocks](https://deq.rocks) · **FAQ:** [deq.rocks/faq](https://deq.rocks/faq.html) · **Support:** [Patreon](https://patreon.com/deqrocks)
 
 ## Basics You Need to Know
-- The server.py lives on your server. It offers access to DeQ's dashboard via your browser. It wraps SSH commands into a User interface.
+- The server.py lives on your server. It offers access to DeQ via your browser. It wraps SSH commands into a user interface.
 - The Android companion app connects to that server.py and polls it for stats.
 - By using a VPN like Tailscale you can remote control or schedule your machines from anywhere and get reliable notifications by setting alert thresholds.
 - Neither the server.py, nor the app ever phone home or collect your data.
@@ -23,7 +23,7 @@
 - **Android Companion app** - free app for your smartphone to manage your servers or get notified when things go wrong
 - **Device Control** - Wake-on-LAN, shutdown, suspend, Docker start/stop
 - **Scheduled Tasks** - Automated backups, wake, shutdown, suspend, and scripts
-- **Scripts** - Run shell scripts from the dashboard or on a schedule
+- **Scripts** - Run shell scripts from the web interface or on a schedule
 - **File Manager** - Dual-pane file browser, copy/move/upload between devices
 - **System Stats** - CPU, RAM, temperature, disk usage
 - **Quick Links** - Bookmarks to your services with custom icons (Lucide or Dashboard Icons)
@@ -54,7 +54,7 @@ Docker would negate its own isolation benefits while adding overhead. To provide
 
 **DeQ stays up when everything else breaks.**
 
-When your Docker daemon crashes, when an update borks the container network, when Portainer can't reach its own backend - your containerized dashboard goes down with the ship. DeQ, running as a simple systemd service, is often still reachable when everything else is on fire.
+When your Docker daemon crashes, when an update borks the container network, when Portainer can't reach its own backend - your containerized tools go down with the ship. DeQ, running as a simple systemd service, is often still reachable when everything else is on fire.
 
 **Yes, it runs as root. Here's why that's okay.**
 
@@ -81,10 +81,9 @@ The installer asks a few questions (IP, port) and gives you your access URL.
 3. Click the pencil icon to edit existing items or to add devices manually
 4. Add links and notes - assign icons
 5. Drag links or devices to reorder them
-6. Click the layout button (eco/1/4/2/4/4/4) to change link arrangement
-7. Click the eye icon to hide sections you don't need
-8. Click the palette icon to toggle monochrome icons
-9. Scroll down to the Theme section to customize colors and wallpaper
+6. Click the eye icon to hide sections you don't need
+7. Click the palette icon to toggle monochrome icons
+8. Scroll down to the Theme section to customize colors and wallpaper
 
 The server running DeQ is automatically added as the "Host" device with local stats.
 
@@ -171,7 +170,7 @@ For secure remote access, use [Tailscale](https://tailscale.com) or another VPN.
 
 ### Admin Password (optional)
 
-Protect your dashboard with a password:
+Protect DeQ with a password:
 
 ```bash
 # Set or change password
@@ -181,7 +180,7 @@ sudo ./install.sh --set-password
 sudo ./install.sh --remove-password
 ```
 
-When set, a login screen appears before accessing the dashboard. Sessions persist until logout or password change.
+When set, a login screen appears before accessing DeQ. Sessions persist until logout or password change.
 
 ## Scheduled Tasks
 <p align="center"><img src="assets/DeQ-Task-Wizard.jpg" width="700"></p>
@@ -198,7 +197,7 @@ Example workflow: Wake your NAS at 3 AM, run a backup from your main server, shu
 
 ## Scripts
 
-Run shell scripts directly from the dashboard. Place executable scripts in `/opt/deq/scripts/` and they appear in the Scripts section.
+Run shell scripts directly from the web interface. Place executable scripts in `/opt/deq/scripts/` and they appear in the Scripts section.
 
 ```bash
 # Example: Create a simple script
@@ -275,7 +274,7 @@ Native Android apps for DeQ - faster startup, background notifications, no brows
 
 | Feature | DeQ (Free) | DeQ Pro (€6.99) |
 |---------|------------|-----------------|
-| WebView Dashboard | ✓ | ✓ |
+| WebView Interface | ✓ | ✓ |
 | Background Polling | 30 min | custom |
 | Push Notifications | ✓ | ✓ |
 | Home Screen Widgets | ✗ | ✓ |
