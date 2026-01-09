@@ -28,12 +28,11 @@ from http.cookies import SimpleCookie
 DEFAULT_PORT = 5050
 DATA_DIR = "/opt/deq"
 CONFIG_FILE = f"{DATA_DIR}/config.json"
-HISTORY_DIR = f"{DATA_DIR}/history"
 SCRIPTS_DIR = f"{DATA_DIR}/scripts"
 PASSWORD_FILE = f"{DATA_DIR}/.password"
 SESSION_SECRET_FILE = f"{DATA_DIR}/.session_secret"
 SESSION_COOKIE_NAME = "deq_session"
-VERSION = "0.9.10"
+VERSION = "0.9.11"
 
 # SSH ControlMaster for connection reuse (reduces overhead when File Manager makes many SSH calls)
 SSH_CONTROL_OPTS = ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/deq-ssh-%r@%h:%p", "-o", "ControlPersist=60", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2"]
@@ -214,7 +213,7 @@ def run_rsync_with_progress(cmd, progress_callback, idle_timeout=60):
     except Exception as e:
         return False, str(e)
 
-def start_transfer_job(device, paths, dest_device, dest_path, operation):
+def start_transfer_job(device, paths, dest_device, dest_path, operation, cleanup_path=None):
     """Start a transfer job in background thread. Returns job_id."""
     job_id = f"transfer_{int(time.time())}_{random.randint(1000, 9999)}"
 
@@ -236,7 +235,7 @@ def start_transfer_job(device, paths, dest_device, dest_path, operation):
 
     thread = threading.Thread(
         target=run_transfer_job,
-        args=(job_id, device, paths, dest_device, dest_path, operation)
+        args=(job_id, device, paths, dest_device, dest_path, operation, cleanup_path)
     )
     thread.daemon = True
     thread.start()
@@ -284,7 +283,7 @@ def cleanup_old_jobs(max_age=300):
         for jid in to_remove:
             del transfer_jobs[jid]
 
-def run_transfer_job(job_id, device, paths, dest_device, dest_path, operation):
+def run_transfer_job(job_id, device, paths, dest_device, dest_path, operation, cleanup_path=None):
     """Execute transfer in background thread."""
     try:
         ssh_config = device.get('ssh', {})
@@ -365,6 +364,20 @@ def run_transfer_job(job_id, device, paths, dest_device, dest_path, operation):
                         capture_output=True
                     )
 
+        # Cleanup temp directory if specified (used by extract cross-device)
+        if cleanup_path:
+            is_host = device.get('is_host', False)
+            if is_host:
+                subprocess.run(f"rm -rf {shlex.quote(cleanup_path)}", shell=True)
+            else:
+                ssh_config = device.get('ssh', {})
+                subprocess.run(
+                    ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no",
+                     "-p", str(ssh_config.get('port', 22)), f"{ssh_config.get('user')}@{device.get('ip')}",
+                     f"rm -rf {shlex.quote(cleanup_path)}"],
+                    capture_output=True
+                )
+
         complete_job(job_id)
 
     except Exception as e:
@@ -398,7 +411,6 @@ TASK_LOGS_DIR = f"{DATA_DIR}/task-logs"
 
 def ensure_dirs():
     os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(HISTORY_DIR, exist_ok=True)
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
     os.makedirs(TASK_LOGS_DIR, exist_ok=True)
 
@@ -473,42 +485,6 @@ def refresh_device_status_async(device):
             refresh_in_progress.discard(dev_id)
 
     threading.Thread(target=do_refresh, daemon=True).start()
-
-# === HISTORY MANAGEMENT ===
-def get_history_file(device_id):
-    return f"{HISTORY_DIR}/{device_id}.json"
-
-def load_history(device_id):
-    path = get_history_file(device_id)
-    if os.path.exists(path):
-        with open(path, 'r') as f:
-            return json.load(f)
-    return {}
-
-def save_history(device_id, history):
-    # Keep only last 400 days
-    cutoff = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
-    history = {k: v for k, v in history.items() if k >= cutoff}
-    with open(get_history_file(device_id), 'w') as f:
-        json.dump(history, f)
-
-def record_stats(device_id, cpu, temp):
-    history = load_history(device_id)
-    today = datetime.now().strftime("%Y-%m-%d")
-    hour = datetime.now().hour
-
-    if today not in history:
-        history[today] = {"hourly": {}, "totals": {"samples": 0, "cpu_sum": 0, "temp_max": 0}}
-
-    # Record hourly (keep latest per hour)
-    history[today]["hourly"][str(hour)] = {"cpu": cpu, "temp": temp}
-
-    # Update totals
-    history[today]["totals"]["samples"] += 1
-    history[today]["totals"]["cpu_sum"] += cpu
-    history[today]["totals"]["temp_max"] = max(history[today]["totals"].get("temp_max", 0), temp or 0)
-
-    save_history(device_id, history)
 
 # === SYSTEM STATS (LOCAL) ===
 def get_disk_smart_info():
@@ -1077,6 +1053,68 @@ def file_operation(device, operation, paths, dest_device=None, dest_path=None, n
             if not success:
                 return {"success": False, "error": f"Failed to create archive: {err}"}
             return {"success": True, "archive": archive_path}
+
+        elif operation == 'extract':
+            if len(paths) != 1:
+                return {"success": False, "error": "Select exactly one archive"}
+            if not dest_path:
+                return {"success": False, "error": "Destination path required"}
+
+            archive = paths[0]
+            name = archive.split('/')[-1].lower()
+            safe_archive = shlex.quote(archive)
+
+            # Determine extract command based on format
+            if name.endswith('.zip'):
+                extract_cmd = lambda dest: f"unzip -o {safe_archive} -d {shlex.quote(dest)}"
+            elif name.endswith(('.tar.gz', '.tgz')):
+                extract_cmd = lambda dest: f"tar -xzf {safe_archive} -C {shlex.quote(dest)}"
+            elif name.endswith(('.tar.bz2', '.tbz2')):
+                extract_cmd = lambda dest: f"tar -xjf {safe_archive} -C {shlex.quote(dest)}"
+            elif name.endswith(('.tar.xz', '.txz')):
+                extract_cmd = lambda dest: f"tar -xJf {safe_archive} -C {shlex.quote(dest)}"
+            elif name.endswith('.tar'):
+                extract_cmd = lambda dest: f"tar -xf {safe_archive} -C {shlex.quote(dest)}"
+            else:
+                return {"success": False, "error": "Unsupported archive format"}
+
+            # Same device: extract directly to dest_path
+            if not dest_device or dest_device.get('id') == device.get('id'):
+                success, err = run_cmd(extract_cmd(dest_path))
+                if not success:
+                    if 'unzip' in err.lower() or 'not found' in err.lower():
+                        return {"success": False, "error": "unzip not installed"}
+                    return {"success": False, "error": f"Extract failed: {err}"}
+                return {"success": True}
+
+            # Cross device: extract to temp, then transfer
+            temp_dir = f"/tmp/deq_extract_{int(time.time())}"
+            run_cmd(f"mkdir -p {shlex.quote(temp_dir)}")
+            success, err = run_cmd(extract_cmd(temp_dir))
+            if not success:
+                run_cmd(f"rm -rf {shlex.quote(temp_dir)}")
+                if 'unzip' in err.lower() or 'not found' in err.lower():
+                    return {"success": False, "error": "unzip not installed"}
+                return {"success": False, "error": f"Extract failed: {err}"}
+
+            # Get list of extracted items
+            if is_host:
+                items = [f"{temp_dir}/{f}" for f in os.listdir(temp_dir)]
+            else:
+                result = subprocess.run(
+                    ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-p", str(port), f"{user}@{ip}",
+                     f"ls -1 {shlex.quote(temp_dir)}"],
+                    capture_output=True, text=True, timeout=30
+                )
+                items = [f"{temp_dir}/{f}" for f in result.stdout.strip().split('\n') if f]
+
+            if not items:
+                run_cmd(f"rm -rf {shlex.quote(temp_dir)}")
+                return {"success": False, "error": "Archive was empty"}
+
+            # Start transfer job (will clean up temp_dir when done)
+            job_id = start_transfer_job(device, items, dest_device, dest_path, 'copy', cleanup_path=temp_dir)
+            return {"success": True, "job_id": job_id, "transfer": True}
 
         elif operation == 'preflight':
             if not paths:
@@ -1670,8 +1708,1006 @@ def ssh_suspend(ip, user, port=22):
         return {"success": False, "error": str(e)}
 
 
+# === TASK EXECUTION ===
+def log_task(task_id, message, max_lines=500):
+    """Append a log line to the task's log file, keeping only last max_lines."""
+    log_file = f"{TASK_LOGS_DIR}/{task_id}.log"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}\n"
+
+    lines = []
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            lines = f.readlines()
+    lines.append(line)
+
+    with open(log_file, 'w') as f:
+        f.writelines(lines[-max_lines:])
+
+# Track running tasks
+running_tasks = {}
+
+def run_task_async(task_id):
+    """Execute a task in a background thread."""
+    global CONFIG, running_tasks
+
+    task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
+    if not task:
+        return
+
+    task_type = task.get('type', 'backup')
+    log_task(task_id, f"Starting {task_type} task: {task.get('name', 'unnamed')}")
+
+    try:
+        if task_type == 'backup':
+            result = run_backup_task(task)
+        elif task_type == 'wake':
+            result = run_wake_task(task)
+        elif task_type == 'shutdown':
+            result = run_shutdown_task(task)
+        elif task_type == 'suspend':
+            result = run_suspend_task(task)
+        elif task_type == 'script':
+            result = run_script_task(task)
+        else:
+            result = {"success": False, "error": f"Unknown task type: {task_type}"}
+
+        # Update task status
+        task['last_run'] = datetime.now().isoformat()
+        if result.get('success'):
+            task['last_status'] = 'success'
+            task['last_error'] = None
+            if 'size' in result:
+                task['last_size'] = result['size']
+            log_task(task_id, f"Completed successfully")
+        elif result.get('skipped'):
+            task['last_status'] = 'skipped'
+            task['last_error'] = result.get('error', 'source offline')
+            log_task(task_id, f"Skipped: {task['last_error']}")
+        else:
+            task['last_status'] = 'failed'
+            task['last_error'] = result.get('error', 'unknown error')
+            log_task(task_id, f"Failed: {task['last_error']}")
+
+        save_config(CONFIG)
+
+    except Exception as e:
+        task['last_run'] = datetime.now().isoformat()
+        task['last_status'] = 'failed'
+        task['last_error'] = str(e)
+        save_config(CONFIG)
+        log_task(task_id, f"Exception: {e}")
+
+    finally:
+        running_tasks.pop(task_id, None)
+
+
+def run_task(task_id):
+    """Start a task in background thread, return immediately."""
+    global CONFIG, running_tasks
+
+    task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
+    if not task:
+        return {"success": False, "error": "Task not found"}
+
+    if task_id in running_tasks:
+        return {"success": False, "error": "Task already running"}
+
+    # Start in background thread
+    running_tasks[task_id] = True
+    thread = threading.Thread(target=run_task_async, args=(task_id,), daemon=True)
+    thread.start()
+
+    return {"success": True, "started": True}
+
+def run_backup_task(task):
+    """Execute a backup task using rsync."""
+    source = task.get('source', {})
+    dest = task.get('dest', {})
+    options = task.get('options', {})
+
+    source_device = next((d for d in CONFIG['devices'] if d['id'] == source.get('device')), None)
+    dest_device = next((d for d in CONFIG['devices'] if d['id'] == dest.get('device')), None)
+
+    if not source_device or not dest_device:
+        return {"success": False, "error": "Source or destination device not found"}
+
+    source_path = source.get('path', '')
+    dest_path = dest.get('path', '')
+
+    if not source_path or not dest_path:
+        return {"success": False, "error": "Source or destination path not specified"}
+
+    # Check if source device is online
+    source_is_host = source_device.get('is_host', False)
+    if not source_is_host:
+        if not ping_host(source_device['ip']):
+            return {"success": False, "skipped": True, "error": "source offline"}
+
+    # Build rsync command
+    rsync_opts = ["-avz", "--stats"]
+    if options.get('delete'):
+        rsync_opts.append("--delete")
+
+    # Source path - respect user's trailing slash choice
+    if source_is_host:
+        rsync_source = source_path
+    else:
+        ssh_user = source_device.get('ssh', {}).get('user', 'root')
+        ssh_port = source_device.get('ssh', {}).get('port', 22)
+        rsync_opts.extend(["-e", f"ssh {SSH_CONTROL_STR} -p {ssh_port} -o StrictHostKeyChecking=no -o ConnectTimeout=10"])
+        rsync_source = f"{ssh_user}@{source_device['ip']}:{source_path}"
+
+    # Destination path - respect user's trailing slash choice
+    dest_is_host = dest_device.get('is_host', False)
+    if dest_is_host:
+        # Ensure destination directory exists
+        os.makedirs(dest_path, exist_ok=True)
+        rsync_dest = dest_path
+    else:
+        ssh_user = dest_device.get('ssh', {}).get('user', 'root')
+        ssh_port = dest_device.get('ssh', {}).get('port', 22)
+        if "-e" not in rsync_opts:
+            rsync_opts.extend(["-e", f"ssh {SSH_CONTROL_STR} -p {ssh_port} -o StrictHostKeyChecking=no -o ConnectTimeout=10"])
+        rsync_dest = f"{ssh_user}@{dest_device['ip']}:{dest_path}"
+
+    cmd = ["rsync"] + rsync_opts + [rsync_source, rsync_dest]
+    log_task(task['id'], f"Running: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+
+        if result.returncode == 0:
+            # Parse total size from rsync stats
+            size = ""
+            for line in result.stdout.split('\n'):
+                if 'Total file size' in line and 'transferred' not in line:
+                    parts = line.split(':')
+                    if len(parts) > 1:
+                        size = parts[1].strip().split()[0]
+                        # Convert to human readable
+                        try:
+                            # Remove thousand separators (comma or dot)
+                            bytes_val = int(size.replace(',', '').replace('.', ''))
+                            if bytes_val >= 1e9:
+                                size = f"{bytes_val/1e9:.1f}GB"
+                            elif bytes_val >= 1e6:
+                                size = f"{bytes_val/1e6:.0f}MB"
+                            else:
+                                size = f"{bytes_val/1e3:.0f}KB"
+                        except:
+                            pass
+            return {"success": True, "size": size}
+        else:
+            return {"success": False, "error": result.stderr[:200] if result.stderr else "rsync failed"}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "timeout (1h)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def run_wake_task(task):
+    """Execute a wake task - WOL for device, docker start for container."""
+    target = task.get('target', 'device')
+
+    if target == 'docker':
+        container = task.get('container')
+        if not container:
+            return {"success": False, "error": "No container specified"}
+        return docker_action(container, 'start')
+
+    # Device wake (WOL)
+    device_id = task.get('device') or task.get('source', {}).get('device')  # backward compat
+    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
+
+    if not device:
+        return {"success": False, "error": "Device not found"}
+
+    if not device.get('wol', {}).get('mac'):
+        return {"success": False, "error": "Device has no WOL configured"}
+
+    result = send_wol(device['wol']['mac'], device['wol'].get('broadcast', '255.255.255.255'))
+    return result
+
+
+def run_shutdown_task(task):
+    """Execute a shutdown task - SSH shutdown for device, docker stop for container."""
+    target = task.get('target', 'device')
+
+    if target == 'docker':
+        container = task.get('container')
+        if not container:
+            return {"success": False, "error": "No container specified"}
+        return docker_action(container, 'stop')
+
+    # Device shutdown
+    device_id = task.get('device')
+    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
+
+    if not device:
+        return {"success": False, "error": "Device not found"}
+
+    # Host device: local shutdown
+    if device.get('is_host'):
+        try:
+            subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # Remote device: SSH shutdown
+    if not device.get('ssh', {}).get('user'):
+        return {"success": False, "error": "Device has no SSH configured"}
+
+    result = ssh_shutdown(device['ip'], device['ssh']['user'], device['ssh'].get('port', 22))
+    return result
+
+def run_suspend_task(task):
+    """Execute a suspend task - SSH suspend for device (no docker equivalent)."""
+    device_id = task.get('device')
+    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
+
+    if not device:
+        return {"success": False, "error": "Device not found"}
+
+    # Host device: local suspend
+    if device.get('is_host'):
+        try:
+            subprocess.Popen(["sudo", "systemctl", "suspend"])
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # Remote device: SSH suspend
+    if not device.get('ssh', {}).get('user'):
+        return {"success": False, "error": "Device has no SSH configured"}
+
+    result = ssh_suspend(device['ip'], device['ssh']['user'], device['ssh'].get('port', 22))
+    return result
+
+def run_script_task(task):
+    """Start a scheduled script."""
+    script_path = task.get('script')
+    if not script_path:
+        return {"success": False, "error": "No script specified"}
+    return execute_quick_action(script_path)
+
+
+# === TASK SCHEDULER ===
+def calculate_next_run(task):
+    """Calculate the next run time for a task based on its schedule."""
+    if not task.get('enabled', True):
+        return None
+
+    schedule = task.get('schedule', {})
+    schedule_type = schedule.get('type', 'daily')
+    time_str = schedule.get('time', '03:00')
+
+    try:
+        hour, minute = map(int, time_str.split(':'))
+    except Exception:
+        hour, minute = 3, 0
+
+    now = datetime.now()
+
+    if schedule_type == 'hourly':
+        # Run every hour at specified minute
+        next_run = now.replace(minute=minute, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(hours=1)
+
+    elif schedule_type == 'daily':
+        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+
+    elif schedule_type == 'weekly':
+        day = schedule.get('day', 0)  # 0 = Sunday
+        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        # Convert to Python weekday (0=Monday)
+        py_day = (day - 1) % 7 if day > 0 else 6
+        days_ahead = py_day - now.weekday()
+        if days_ahead < 0 or (days_ahead == 0 and next_run <= now):
+            days_ahead += 7
+        next_run += timedelta(days=days_ahead)
+
+    elif schedule_type == 'monthly':
+        date = schedule.get('date', 1)
+        # Try current month first
+        year, month = now.year, now.month
+        for _ in range(12):  # Try up to 12 months ahead
+            try:
+                next_run = datetime(year, month, date, hour, minute, 0)
+                if next_run > now:
+                    break
+                # Move to next month
+                month += 1
+                if month > 12:
+                    month = 1
+                    year += 1
+            except ValueError:
+                # Invalid day for this month (e.g., Feb 30), try next month
+                month += 1
+                if month > 12:
+                    month = 1
+                    year += 1
+        else:
+            return None  # Could not find valid date
+    else:
+        return None
+
+    return next_run.isoformat()
+
+
+class TaskScheduler:
+    """Background scheduler for automated task execution."""
+
+    def __init__(self):
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        """Start the scheduler thread."""
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        print("Task scheduler started")
+
+    def stop(self):
+        """Stop the scheduler thread."""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=5)
+        print("Task scheduler stopped")
+
+    def _run(self):
+        """Main scheduler loop - checks every 60 seconds for due tasks."""
+        # Update next_run times on startup
+        self._update_next_runs()
+
+        while self.running:
+            try:
+                self._check_and_run_tasks()
+            except Exception as e:
+                print(f"Scheduler error: {e}")
+
+            # Sleep for 60 seconds, but check running flag periodically
+            for _ in range(60):
+                if not self.running:
+                    break
+                time.sleep(1)
+
+    def _update_next_runs(self):
+        """Update next_run times for all tasks, preserving valid future times."""
+        global CONFIG
+        changed = False
+        now = datetime.now()
+        for task in CONFIG.get('tasks', []):
+            if task.get('enabled', True):
+                current_next = task.get('next_run')
+                if current_next:
+                    try:
+                        next_dt = datetime.fromisoformat(current_next)
+                        if next_dt > now:
+                            continue
+                    except:
+                        pass
+                next_run = calculate_next_run(task)
+                if next_run != current_next:
+                    task['next_run'] = next_run
+                    changed = True
+        if changed:
+            save_config(CONFIG)
+
+    def _check_and_run_tasks(self):
+        """Check for tasks due to run and execute them."""
+        global CONFIG
+        now = datetime.now()
+
+        for task in CONFIG.get('tasks', []):
+            if not task.get('enabled', True):
+                continue
+
+            next_run_str = task.get('next_run')
+            if not next_run_str:
+                # Calculate and set next_run if missing
+                task['next_run'] = calculate_next_run(task)
+                save_config(CONFIG)
+                continue
+
+            try:
+                next_run = datetime.fromisoformat(next_run_str)
+            except:
+                continue
+
+            if now >= next_run:
+                print(f"Running scheduled task: {task.get('name', task['id'])}")
+                run_task(task['id'])
+
+                # Calculate next run time
+                task['next_run'] = calculate_next_run(task)
+                save_config(CONFIG)
+
+
+# Global scheduler instance
+task_scheduler = TaskScheduler()
+
+
+class RequestHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        print(f"[{self.log_date_time_string()}] {args[0]}")
+    
+    def send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+    
+    def send_html(self, html):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(html.encode())
+    
+    def send_file(self, content, content_type, cache=True):
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        if cache:
+            self.send_header('Cache-Control', 'public, max-age=31536000')
+        self.end_headers()
+        if isinstance(content, str):
+            self.wfile.write(content.encode())
+        else:
+            self.wfile.write(content)
+
+    def get_session_cookie(self):
+        """Get session token from cookie."""
+        cookie_header = self.headers.get('Cookie', '')
+        cookie = SimpleCookie()
+        cookie.load(cookie_header)
+        if SESSION_COOKIE_NAME in cookie:
+            return cookie[SESSION_COOKIE_NAME].value
+        return None
+
+    def is_authenticated(self):
+        """Check if request is authenticated."""
+        if not is_auth_enabled():
+            return True
+        token = self.get_session_cookie()
+        return verify_session_token(token)
+
+    def send_login_page(self):
+        """Send login page HTML."""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(get_login_page().encode())
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        query = parse_qs(urlparse(self.path).query)
+
+        # Static files don't require auth
+        if path in ['/manifest.json', '/icon.svg'] or path.startswith('/fonts/'):
+            pass  # Continue to serve static files
+        elif not self.is_authenticated():
+            self.send_login_page()
+            return
+
+        if path == '/' or path == '':
+            needs_onboarding = not CONFIG.get('onboarding_done') and len(CONFIG.get('devices', [])) <= 1
+            html = get_html_page().replace('__NEEDS_ONBOARDING__', 'true' if needs_onboarding else 'false')
+            self.send_html(html)
+            return
+        
+        if path == '/manifest.json':
+            self.send_file(get_manifest_json(), 'application/manifest+json')
+            return
+        
+        if path == '/icon.svg':
+            self.send_file(get_icon_svg(), 'image/svg+xml')
+            return
+
+        if path.startswith('/fonts/'):
+            font_name = path.split('/')[-1]
+            # Try local fonts dir first (bundled), then DATA_DIR
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            font_paths = [
+                os.path.join(script_dir, 'fonts', font_name),
+                f"{DATA_DIR}/fonts/{font_name}"
+            ]
+            for font_path in font_paths:
+                if os.path.exists(font_path):
+                    with open(font_path, 'rb') as f:
+                        self.send_file(f.read(), 'font/woff2')
+                    return
+            self.send_response(404)
+            self.end_headers()
+            return
+        
+        # API
+        if path.startswith('/api/'):
+            api_path = path[5:].split('?')[0]
+            
+            if api_path == 'config':
+                self.send_json({"success": True, "config": get_config_with_defaults(), "running_tasks": list(running_tasks.keys()), "auth_enabled": is_auth_enabled()})
+                return
+            
+            if api_path == 'stats/host':
+                self.send_json({"success": True, "stats": get_local_stats()})
+                return
+
+            if api_path == 'health':
+                health = get_health_status()
+                self.send_json(health)
+                return
+
+            if api_path == 'version':
+                self.send_json({"version": VERSION, "name": "DeQ"})
+                return
+
+            if api_path == 'network/scan':
+                result = scan_network()
+                self.send_json(result)
+                return
+
+            if api_path == 'scripts/scan':
+                scripts = discover_scripts()
+                self.send_json({"success": True, "scripts": scripts})
+                return
+
+            if api_path.startswith('job/'):
+                job_id = api_path.split('/')[1]
+                status = get_job_status(job_id)
+                self.send_json(status)
+                return
+
+            if api_path.startswith('quick-action/') and api_path.endswith('/run'):
+                parts = api_path.split('/')
+                qa_id = parts[1]
+                qa = next((q for q in CONFIG.get('quick_actions', []) if q['id'] == qa_id), None)
+                if not qa:
+                    self.send_json({"success": False, "error": "Quick action not found"}, 404)
+                    return
+                result = execute_quick_action(qa['path'])
+                self.send_json(result)
+                return
+
+            if api_path.startswith('device/'):
+                parts = api_path.split('/')
+                if len(parts) >= 3:
+                    dev_id = parts[1]
+                    action = parts[2]
+                    dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
+                    
+                    if not dev:
+                        self.send_json({"success": False, "error": "Device not found"}, 404)
+                        return
+                    
+                    if action == 'scan-containers':
+                        result = scan_docker_containers(dev)
+                        self.send_json(result)
+                        return
+
+                    if action == 'ssh-check':
+                        ssh_config = dev.get('ssh', {})
+                        if not ssh_config.get('user'):
+                            self.send_json({"success": False, "error": "No SSH user configured"})
+                            return
+                        try:
+                            result = subprocess.run(
+                                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                                 "-p", str(ssh_config.get('port', 22)), f"{ssh_config['user']}@{dev['ip']}", "echo ok"],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if result.returncode == 0 and 'ok' in result.stdout:
+                                self.send_json({"success": True})
+                            else:
+                                self.send_json({"success": False, "error": "SSH auth failed"})
+                        except subprocess.TimeoutExpired:
+                            self.send_json({"success": False, "error": "SSH timeout"})
+                        except Exception as e:
+                            self.send_json({"success": False, "error": str(e)})
+                        return
+
+                    if action == 'status':
+                        cached = get_cached_status(dev_id)
+                        refresh_device_status_async(dev)
+                        if cached:
+                            self.send_json({"success": True, **cached})
+                        else:
+                            self.send_json({"success": True, "online": None, "stats": None, "containers": {}})
+                        return
+
+                    if action == 'stats':
+                        if dev.get('is_host'):
+                            stats = get_local_stats()
+                            online = True
+                        else:
+                            online = ping_host(dev.get('ip', ''))
+                            ssh = dev.get('ssh', {})
+                            if online and ssh.get('user'):
+                                stats = get_remote_stats(dev['ip'], ssh['user'], ssh.get('port', 22))
+                            else:
+                                stats = None
+                        self.send_json({"success": True, "stats": stats or {}, "online": online})
+                        return
+
+                    if action == 'wake':
+                        if dev.get('wol', {}).get('mac'):
+                            result = send_wol(dev['wol']['mac'], dev['wol'].get('broadcast', '255.255.255.255'))
+                            self.send_json(result)
+                        else:
+                            self.send_json({"success": False, "error": "WOL not configured"})
+                        return
+                    
+                    if action == 'shutdown':
+                        # Host device: local shutdown
+                        if dev.get('is_host'):
+                            try:
+                                subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+                                self.send_json({"success": True})
+                            except Exception as e:
+                                self.send_json({"success": False, "error": str(e)})
+                            return
+
+                        if dev.get('ssh', {}).get('user'):
+                            result = ssh_shutdown(dev['ip'], dev['ssh']['user'], dev['ssh'].get('port', 22))
+                            self.send_json(result)
+                        else:
+                            self.send_json({"success": False, "error": "SSH not configured"})
+                        return
+
+                    if action == 'suspend':
+                        # Host device: local suspend
+                        if dev.get('is_host'):
+                            try:
+                                subprocess.Popen(["sudo", "systemctl", "suspend"])
+                                self.send_json({"success": True})
+                            except Exception as e:
+                                self.send_json({"success": False, "error": str(e)})
+                            return
+
+                        if dev.get('ssh', {}).get('user'):
+                            result = ssh_suspend(dev['ip'], dev['ssh']['user'], dev['ssh'].get('port', 22))
+                            self.send_json(result)
+                        else:
+                            self.send_json({"success": False, "error": "SSH not configured"})
+                        return
+                    
+                    # Docker: /api/device/{id}/docker/{container}/{action}
+                    if action == 'docker' and len(parts) >= 5:
+                        container_name = parts[3]
+                        docker_act = parts[4]
+
+                        if not is_valid_container_name(container_name):
+                            self.send_json({"success": False, "error": "Invalid container name"})
+                            return
+
+                        containers = dev.get('docker', {}).get('containers', [])
+                        container_names = [c.get('name') if isinstance(c, dict) else c for c in containers]
+
+                        if container_name not in container_names:
+                            self.send_json({"success": False, "error": f"Container '{container_name}' not configured"})
+                            return
+
+                        if dev.get('is_host'):
+                            result = docker_action(container_name, docker_act)
+                        else:
+                            ssh_config = dev.get('ssh', {})
+                            if ssh_config.get('user'):
+                                result = remote_docker_action(
+                                    dev['ip'],
+                                    ssh_config['user'],
+                                    ssh_config.get('port', 22),
+                                    container_name,
+                                    docker_act
+                                )
+                            else:
+                                result = {"success": False, "error": "SSH not configured"}
+
+                        self.send_json(result)
+                        return
+
+                    # Browse folders: /api/device/{id}/browse?path=/
+                    if action == 'browse':
+                        browse_path = query.get('path', ['/'])[0]
+                        result = browse_folder(dev, browse_path)
+                        self.send_json(result)
+                        return
+
+                    # List files: /api/device/{id}/files?path=/
+                    if action == 'files':
+                        file_path = query.get('path', ['/'])[0]
+                        result = list_files(dev, file_path)
+                        self.send_json(result)
+                        return
+
+                    # Download file: /api/device/{id}/download?path=/file.txt
+                    if action == 'download':
+                        file_path = query.get('path', [''])[0]
+                        if not file_path:
+                            self.send_json({"success": False, "error": "Path required"}, 400)
+                            return
+                        content, filename, error = get_file_for_download(dev, file_path)
+                        if error:
+                            self.send_json({"success": False, "error": error}, 400)
+                            return
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/octet-stream')
+                        self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                        self.send_header('Content-Length', len(content))
+                        self.end_headers()
+                        self.wfile.write(content)
+                        return
+
+            # Task status (check if running)
+            if api_path.startswith('task/') and api_path.endswith('/status'):
+                task_id = api_path.split('/')[1]
+                is_running = task_id in running_tasks
+                task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
+                if task:
+                    self.send_json({
+                        "success": True,
+                        "running": is_running,
+                        "last_status": task.get('last_status'),
+                        "last_error": task.get('last_error'),
+                        "last_size": task.get('last_size')
+                    })
+                else:
+                    self.send_json({"success": False, "error": "Task not found"}, 404)
+                return
+
+            self.send_json({"success": False, "error": "Not found"}, 404)
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+
+        # Auth endpoints (no auth required for login)
+        if path == '/auth/login':
+            length = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(length)) if length > 0 else {}
+            password = data.get('password', '')
+            if verify_password(password):
+                token = create_session_token()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Set-Cookie', f'{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True}).encode())
+            else:
+                self.send_json({"success": False, "error": "Invalid password"}, 401)
+            return
+
+        if path == '/auth/logout':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Set-Cookie', f'{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0')
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True}).encode())
+            return
+
+        # All other POST requests require auth
+        if not self.is_authenticated():
+            self.send_json({"success": False, "error": "Unauthorized"}, 401)
+            return
+
+        if path == '/api/config':
+            length = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(length))
+            global CONFIG
+            CONFIG = data
+            # Update next_run for all enabled tasks
+            for task in CONFIG.get('tasks', []):
+                if task.get('enabled', True):
+                    task['next_run'] = calculate_next_run(task)
+            save_config(CONFIG)
+            self.send_json({"success": True})
+            return
+
+        if path == '/api/onboarding/complete':
+            CONFIG['onboarding_done'] = True
+            save_config(CONFIG)
+            self.send_json({"success": True})
+            return
+
+        # Task execution
+        if path.startswith('/api/task/') and path.endswith('/run'):
+            task_id = path.split('/')[3]
+            result = run_task(task_id)
+            self.send_json(result)
+            return
+
+        # Task toggle (pause/resume)
+        if path.startswith('/api/task/') and path.endswith('/toggle'):
+            task_id = path.split('/')[3]
+            for task in CONFIG.get('tasks', []):
+                if task['id'] == task_id:
+                    task['enabled'] = not task.get('enabled', True)
+                    if task['enabled']:
+                        task['next_run'] = calculate_next_run(task)
+                    save_config(CONFIG)
+                    self.send_json({"success": True, "enabled": task['enabled']})
+                    return
+            self.send_json({"success": False, "error": "Task not found"}, 404)
+            return
+
+        # File operations: /api/device/{id}/files
+        if path.startswith('/api/device/') and path.endswith('/files'):
+            parts = path.split('/')
+            dev_id = parts[3]
+            dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
+
+            if not dev:
+                self.send_json({"success": False, "error": "Device not found"}, 404)
+                return
+
+            length = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(length))
+            operation = data.get('operation')
+            paths = data.get('paths', [])
+
+            if operation in ('copy', 'move', 'preflight'):
+                dest_dev_id = data.get('dest_device')
+                dest_path = data.get('dest_path')
+                dest_dev = next((d for d in CONFIG['devices'] if d['id'] == dest_dev_id), None)
+                if not dest_dev:
+                    self.send_json({"success": False, "error": "Destination device not found"}, 404)
+                    return
+                result = file_operation(dev, operation, paths, dest_device=dest_dev, dest_path=dest_path)
+            elif operation == 'extract':
+                dest_dev_id = data.get('dest_device')
+                dest_path = data.get('dest_path')
+                dest_dev = next((d for d in CONFIG['devices'] if d['id'] == dest_dev_id), None) if dest_dev_id else None
+                result = file_operation(dev, operation, paths, dest_device=dest_dev, dest_path=dest_path)
+            elif operation == 'rename':
+                new_name = data.get('new_name')
+                result = file_operation(dev, operation, paths, new_name=new_name)
+            elif operation == 'mkdir':
+                new_name = data.get('new_name')
+                result = file_operation(dev, operation, paths, new_name=new_name)
+            elif operation in ('delete', 'zip'):
+                result = file_operation(dev, operation, paths)
+            else:
+                result = {"success": False, "error": f"Unknown operation: {operation}"}
+
+            self.send_json(result)
+            return
+
+        # File upload: /api/device/{id}/upload?path=/dest/folder
+        if path.startswith('/api/device/') and '/upload' in path:
+            parts = path.split('/')
+            dev_id = parts[3]
+            dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
+
+            if not dev:
+                self.send_json({"success": False, "error": "Device not found"}, 404)
+                return
+
+            parsed = urlparse(self.path)
+            query = parse_qs(parsed.query)
+            dest_path = query.get('path', ['/'])[0]
+
+            # Parse multipart form data
+            content_type = self.headers.get('Content-Type', '')
+            if 'multipart/form-data' not in content_type:
+                self.send_json({"success": False, "error": "Expected multipart/form-data"}, 400)
+                return
+
+            # Extract boundary
+            boundary = None
+            for part in content_type.split(';'):
+                part = part.strip()
+                if part.startswith('boundary='):
+                    boundary = part[9:].strip('"')
+                    break
+
+            if not boundary:
+                self.send_json({"success": False, "error": "No boundary in multipart"}, 400)
+                return
+
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+
+            # Parse multipart - simple parser for single file
+            boundary_bytes = ('--' + boundary).encode()
+            parts = body.split(boundary_bytes)
+
+            uploaded = 0
+            errors = []
+
+            for part in parts:
+                if b'Content-Disposition: form-data;' not in part:
+                    continue
+                if b'filename="' not in part:
+                    continue
+
+                # Extract filename
+                header_end = part.find(b'\r\n\r\n')
+                if header_end == -1:
+                    continue
+                header = part[:header_end].decode('utf-8', errors='ignore')
+                content = part[header_end + 4:]
+
+                # Remove trailing \r\n--
+                if content.endswith(b'\r\n'):
+                    content = content[:-2]
+                if content.endswith(b'--'):
+                    content = content[:-2]
+                if content.endswith(b'\r\n'):
+                    content = content[:-2]
+
+                # Get filename from header
+                match = re.search(r'filename="([^"]+)"', header)
+                if not match:
+                    continue
+                filename = match.group(1)
+
+                # Upload file
+                result = upload_file(dev, dest_path, filename, content)
+                if result['success']:
+                    uploaded += 1
+                else:
+                    errors.append(f"{filename}: {result['error']}")
+
+            if errors:
+                self.send_json({"success": False, "error": "; ".join(errors), "uploaded": uploaded})
+            else:
+                self.send_json({"success": True, "uploaded": uploaded})
+            return
+
+        self.send_json({"success": False, "error": "Not found"}, 404)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='DeQ - Homelab Dashboard')
+    parser.add_argument('--port', type=int, default=DEFAULT_PORT, help=f'Port to run on (default: {DEFAULT_PORT})')
+    args = parser.parse_args()
+
+    port = args.port
+
+    print(f"""
+================================================================
+              DeQ - Homelab Admin Panel
+================================================================
+  Version: {VERSION}
+  Port:    {port}
+
+  Access URL:
+  http://YOUR-IP:{port}/
+================================================================
+    """)
+
+    # Clean up stale SSH ControlMaster sockets from previous runs
+    for socket_file in glob.glob("/tmp/deq-ssh-*"):
+        try:
+            os.remove(socket_file)
+        except OSError:
+            pass
+
+    # Start task scheduler
+    task_scheduler.start()
+
+    server = HTTPServer(('0.0.0.0', port), RequestHandler)
+    print(f"Server running on port {port}...")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        task_scheduler.stop()
+        server.shutdown()
+
 # === LOGIN PAGE ===
-LOGIN_PAGE = '''<!DOCTYPE html>
+def get_login_page():
+    return '''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1719,14 +2755,14 @@ LOGIN_PAGE = '''<!DOCTYPE html>
             border-color: #2ed573;
             box-shadow: 0 0 0 1px #2ed57333;
         }
-        .error {
+        .login-error {
             color: #ff4757;
             font-size: 12px;
             margin-top: 12px;
             opacity: 0;
             transition: opacity 0.2s;
         }
-        .error.visible { opacity: 1; }
+        .login-error.visible { opacity: 1; }
     </style>
 </head>
 <body>
@@ -1743,7 +2779,7 @@ LOGIN_PAGE = '''<!DOCTYPE html>
     <form id="login-form">
         <input type="password" id="password" placeholder="Enter Password" autocomplete="current-password" autofocus>
     </form>
-    <div class="error" id="error">Invalid password</div>
+    <div class="login-error" id="error">Invalid password</div>
     <script>
         document.getElementById('login-form').addEventListener('submit', async (e) => {
             e.preventDefault();
@@ -1766,7 +2802,8 @@ LOGIN_PAGE = '''<!DOCTYPE html>
 </html>'''
 
 # === HTML TEMPLATE ===
-HTML_PAGE = '''<!DOCTYPE html>
+def get_html_page():
+    return '''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1908,13 +2945,6 @@ HTML_PAGE = '''<!DOCTYPE html>
             color: var(--text-primary);
         }
 
-        #files-btn:hover,
-        #edit-toggle:hover {
-            background: var(--bg-secondary);
-            color: var(--text-primary);
-            border-color: var(--accent);
-            box-shadow: 0 0 4px var(--accent);
-        }
 
         .logo svg .icon-bg,
         #files-btn svg .icon-bg,
@@ -2047,10 +3077,6 @@ HTML_PAGE = '''<!DOCTYPE html>
             position: relative;
         }
         
-        .card-item:hover {
-            border-color: var(--accent);
-            background: var(--bg-tertiary);
-        }
 
         .edit-mode .card-item {
             cursor: grab;
@@ -2703,15 +3729,6 @@ HTML_PAGE = '''<!DOCTYPE html>
             gap: 4px;
         }
 
-        .task-btn:hover {
-            border-color: var(--text-secondary);
-            color: var(--text-primary);
-        }
-
-        .task-btn.danger:hover {
-            border-color: var(--danger);
-            color: var(--danger);
-        }
 
         .task-empty {
             text-align: center;
@@ -2794,48 +3811,6 @@ HTML_PAGE = '''<!DOCTYPE html>
             height: 16px;
         }
 
-        /* History chart */
-        .device-chart {
-            height: 32px;
-            display: flex;
-            align-items: flex-end;
-            gap: 2px;
-            margin-bottom: 8px;
-        }
-        
-        .chart-bar {
-            flex: 1;
-            background: var(--accent);
-            opacity: 0.6;
-            border-radius: 2px 2px 0 0;
-            min-height: 2px;
-        }
-        
-        .chart-bar:hover {
-            opacity: 1;
-        }
-        
-        .device-chart-footer {
-            display: flex;
-            justify-content: space-between;
-            font-size: 11px;
-            color: var(--text-secondary);
-            margin-bottom: 12px;
-        }
-        
-        .chart-period-select {
-            background: none;
-            border: none;
-            color: var(--text-secondary);
-            font-family: inherit;
-            font-size: 11px;
-            cursor: pointer;
-        }
-        
-        .chart-period-select:hover {
-            color: var(--text-primary);
-        }
-        
         .device-actions {
             display: flex;
             flex-wrap: wrap;
@@ -2952,6 +3927,38 @@ HTML_PAGE = '''<!DOCTYPE html>
             grid-template-columns: repeat(3, 1fr);
             gap: 16px;
             margin-bottom: 16px;
+        }
+
+        /* Hover states - only on devices with pointer */
+        @media (hover: hover) {
+            #files-btn:hover,
+            #edit-toggle:hover {
+                background: var(--bg-secondary);
+                color: var(--text-primary);
+                border-color: var(--accent);
+                box-shadow: 0 0 4px var(--accent);
+            }
+            .card-item:hover {
+                border-color: var(--accent);
+                background: var(--bg-tertiary);
+            }
+            .task-btn:hover {
+                border-color: var(--text-secondary);
+                color: var(--text-primary);
+            }
+            .task-btn.danger:hover {
+                border-color: var(--danger);
+                color: var(--danger);
+            }
+            .fm-btn:hover:not(:disabled) {
+                background: var(--accent);
+                border-color: var(--accent);
+                color: var(--bg-primary);
+            }
+            .fm-btn.danger:hover:not(:disabled) {
+                background: var(--danger);
+                border-color: var(--danger);
+            }
         }
 
         @media (max-width: 600px) {
@@ -3127,7 +4134,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             align-items: center;
             justify-content: center;
             z-index: 1000;
-            padding: 24px;
+            padding: 10px;
         }
         
         .modal.visible {
@@ -3140,7 +4147,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             border-radius: 12px;
             padding: 24px;
             width: 100%;
-            max-width: 500px;
+            max-width: 800px;
             max-height: 92vh;
             overflow-y: auto;
         }
@@ -3374,31 +4381,42 @@ HTML_PAGE = '''<!DOCTYPE html>
             border-bottom: 1px solid var(--border);
         }
 
+        .fm-header-row {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
         .fm-pane-header select {
-            width: 100%;
-            margin-bottom: 8px;
+            flex: 1;
+            min-width: 0;
+            font-size: 11px;
+            text-overflow: ellipsis;
         }
 
         .fm-storage {
+            flex: 1;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
             font-size: 11px;
             color: var(--text-secondary);
-            margin-bottom: 6px;
+            min-width: 0;
         }
 
         .fm-storage-text {
             white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .fm-storage-bar {
-            flex: 1;
+            flex-shrink: 0;
+            width: 50px;
             height: 6px;
             background: var(--bg-primary);
             border-radius: 3px;
             overflow: hidden;
-            max-width: 80px;
         }
 
         .fm-storage-fill {
@@ -3408,7 +4426,8 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
 
         .fm-storage-percent {
-            min-width: 32px;
+            flex-shrink: 0;
+            min-width: 28px;
             text-align: right;
         }
 
@@ -3438,6 +4457,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             cursor: pointer;
             border-bottom: 1px solid var(--border);
             color: var(--text-primary);
+            font-size: 11px;
             transition: background 0.1s;
         }
 
@@ -3500,19 +4520,11 @@ HTML_PAGE = '''<!DOCTYPE html>
             border-radius: 6px;
             color: var(--text-primary);
             font-family: inherit;
-            font-size: 12px;
+            font-size: 11px;
             cursor: pointer;
             transition: all 0.15s;
             position: relative;
             z-index: 1;
-        }
-
-        @media (hover: hover) {
-            .fm-btn:hover:not(:disabled) {
-                background: var(--accent);
-                border-color: var(--accent);
-                color: var(--bg-primary);
-            }
         }
 
         .fm-btn:active:not(:disabled) {
@@ -3524,13 +4536,6 @@ HTML_PAGE = '''<!DOCTYPE html>
         .fm-btn:disabled {
             opacity: 0.3;
             cursor: not-allowed;
-        }
-
-        @media (hover: hover) {
-            .fm-btn.danger:hover:not(:disabled) {
-                background: var(--danger);
-                border-color: var(--danger);
-            }
         }
 
         .fm-btn.danger:active:not(:disabled) {
@@ -3607,7 +4612,8 @@ HTML_PAGE = '''<!DOCTYPE html>
                 padding: 8px;
             }
 
-            .fm-pane-header select {
+            .fm-header-row {
+                gap: 6px;
                 margin-bottom: 4px;
             }
 
@@ -3627,7 +4633,6 @@ HTML_PAGE = '''<!DOCTYPE html>
 
             .fm-btn {
                 padding: 6px 10px;
-                font-size: 11px;
             }
         }
 
@@ -3791,10 +4796,6 @@ HTML_PAGE = '''<!DOCTYPE html>
         .btn-secondary {
             background: var(--bg-tertiary);
             color: var(--text-primary);
-        }
-        
-        .btn-danger {
-            background: var(--danger);
         }
         
         .modal-actions {
@@ -4460,30 +5461,33 @@ HTML_PAGE = '''<!DOCTYPE html>
             <div class="fm-container">
                 <div class="fm-pane" id="fm-left">
                     <div class="fm-pane-header">
-                        <select class="form-input" id="fm-left-device" onchange="fmLoadFiles('left')"></select>
-                        <div class="fm-storage" id="fm-left-storage"></div>
+                        <div class="fm-header-row">
+                            <select class="form-input" id="fm-left-device" onchange="fmLoadFiles('left')"></select>
+                            <div class="fm-storage" id="fm-left-storage"></div>
+                        </div>
                         <div class="fm-path" id="fm-left-path">/</div>
                     </div>
                     <div class="fm-list" id="fm-left-list"></div>
                 </div>
                 <div class="fm-pane" id="fm-right">
                     <div class="fm-pane-header">
-                        <select class="form-input" id="fm-right-device" onchange="fmLoadFiles('right')"></select>
-                        <div class="fm-storage" id="fm-right-storage"></div>
+                        <div class="fm-header-row">
+                            <select class="form-input" id="fm-right-device" onchange="fmLoadFiles('right')"></select>
+                            <div class="fm-storage" id="fm-right-storage"></div>
+                        </div>
                         <div class="fm-path" id="fm-right-path">/</div>
                     </div>
                     <div class="fm-list" id="fm-right-list"></div>
                 </div>
             </div>
             <div class="fm-actions">
-                <button class="fm-btn" id="fm-copy-right" onclick="fmCopy('left', 'right')" disabled>Copy →</button>
-                <button class="fm-btn" id="fm-copy-left" onclick="fmCopy('right', 'left')" disabled>← Copy</button>
-                <button class="fm-btn" id="fm-move-right" onclick="fmMove('left', 'right')" disabled>Move →</button>
-                <button class="fm-btn" id="fm-move-left" onclick="fmMove('right', 'left')" disabled>← Move</button>
+                <button class="fm-btn" id="fm-copy" onclick="fmCopy()" disabled>Copy</button>
+                <button class="fm-btn" id="fm-move" onclick="fmMove()" disabled>Move</button>
                 <button class="fm-btn" id="fm-newfolder" onclick="fmNewFolder()" disabled>New Folder</button>
                 <button class="fm-btn" id="fm-rename" onclick="fmRename()" disabled>Rename</button>
                 <button class="fm-btn danger" id="fm-delete" onclick="fmDelete()" disabled>Delete</button>
                 <button class="fm-btn" id="fm-zip" onclick="fmZip()" disabled>Zip</button>
+                <button class="fm-btn" id="fm-extract" onclick="fmExtract()" disabled>Extract</button>
                 <button class="fm-btn" id="fm-download" onclick="fmDownload()" disabled>Download</button>
                 <button class="fm-btn" id="fm-upload" onclick="document.getElementById('fm-upload-input').click()">Upload</button>
                 <input type="file" id="fm-upload-input" multiple style="display:none" onchange="fmUploadFiles(this.files)">
@@ -4768,11 +5772,21 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         // Toggle between bar and value display
         let showValues = false;
+        let showValuesTimer = null;
         function toggleStatsMode(el) {
+            if (showValuesTimer) clearTimeout(showValuesTimer);
             showValues = !showValues;
             document.querySelectorAll('.device-stats-bars').forEach(bars => {
                 bars.classList.toggle('show-values', showValues);
             });
+            if (showValues) {
+                showValuesTimer = setTimeout(() => {
+                    showValues = false;
+                    document.querySelectorAll('.device-stats-bars').forEach(bars => {
+                        bars.classList.remove('show-values');
+                    });
+                }, 5000);
+            }
         }
 
         // === Render Functions ===
@@ -5477,7 +6491,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                         </div>
                     </div>
                     ${online && (s.cpu !== undefined) ? `
-                        <div class="device-stats-bars" onclick="toggleStatsMode(this)">
+                        <div class="device-stats-bars${showValues ? ' show-values' : ''}" onclick="toggleStatsMode(this)">
                             <div class="stat-bar-group">
                                 <span class="stat-label">CPU</span>
                                 <div class="stat-bar"><div class="stat-bar-fill" style="width: ${s.cpu}%; background: ${getBarColor(s.cpu)}"></div></div>
@@ -6674,11 +7688,9 @@ HTML_PAGE = '''<!DOCTYPE html>
             const rightSel = fmState.right.selected.size;
             const totalSel = leftSel + rightSel;
 
-            // Copy/Move: need selection on source side
-            document.getElementById('fm-copy-right').disabled = leftSel === 0 || fmState.busy;
-            document.getElementById('fm-copy-left').disabled = rightSel === 0 || fmState.busy;
-            document.getElementById('fm-move-right').disabled = leftSel === 0 || fmState.busy;
-            document.getElementById('fm-move-left').disabled = rightSel === 0 || fmState.busy;
+            // Copy/Move: need selection
+            document.getElementById('fm-copy').disabled = totalSel === 0 || fmState.busy;
+            document.getElementById('fm-move').disabled = totalSel === 0 || fmState.busy;
 
             // New Folder: always enabled if not busy and pane is active
             document.getElementById('fm-newfolder').disabled = !fmState.activePane || fmState.busy;
@@ -6689,6 +7701,19 @@ HTML_PAGE = '''<!DOCTYPE html>
             // Delete/Zip: at least one selection
             document.getElementById('fm-delete').disabled = totalSel === 0 || fmState.busy;
             document.getElementById('fm-zip').disabled = totalSel === 0 || fmState.busy;
+
+            // Extract: one archive file
+            let canExtract = false;
+            if (totalSel === 1) {
+                const pane = leftSel === 1 ? 'left' : 'right';
+                const idx = Array.from(fmState[pane].selected)[0];
+                const file = fmState[pane].files[idx];
+                if (file && !file.is_dir) {
+                    const n = file.name.toLowerCase();
+                    canExtract = n.endsWith('.zip') || n.endsWith('.tar') || n.endsWith('.tar.gz') || n.endsWith('.tgz') || n.endsWith('.tar.bz2') || n.endsWith('.tbz2') || n.endsWith('.tar.xz') || n.endsWith('.txz');
+                }
+            }
+            document.getElementById('fm-extract').disabled = !canExtract || fmState.busy;
 
             // Download: one file (not folder)
             let canDownload = false;
@@ -6701,12 +7726,14 @@ HTML_PAGE = '''<!DOCTYPE html>
             document.getElementById('fm-download').disabled = !canDownload || fmState.busy;
         }
 
-        async function fmCopy(fromPane, toPane) {
-            await fmTransfer('copy', fromPane, toPane);
+        async function fmCopy() {
+            const from = fmState.left.selected.size > 0 ? 'left' : 'right';
+            await fmTransfer('copy', from, from === 'left' ? 'right' : 'left');
         }
 
-        async function fmMove(fromPane, toPane) {
-            await fmTransfer('move', fromPane, toPane);
+        async function fmMove() {
+            const from = fmState.left.selected.size > 0 ? 'left' : 'right';
+            await fmTransfer('move', from, from === 'left' ? 'right' : 'left');
         }
 
         async function fmTransfer(operation, fromPane, toPane) {
@@ -6766,42 +7793,36 @@ HTML_PAGE = '''<!DOCTYPE html>
                 return;
             }
 
-            // 4. Show progress UI
+            // 4. Poll job
+            fmPollJob(start.job_id, operation === 'move' ? 'Moving' : 'Copying', () => {
+                toast(operation === 'move' ? 'Moved successfully' : 'Copied successfully');
+                fromState.selected.clear();
+                fmLoadFiles(fromPane);
+                fmLoadFiles(toPane);
+            });
+        }
+
+        function fmPollJob(jobId, action, onComplete) {
             const progressEl = document.getElementById('fm-progress');
             const progressFill = document.getElementById('fm-progress-fill');
             const progressText = document.getElementById('fm-progress-text');
             progressEl.classList.add('visible');
             progressFill.style.width = '0%';
 
-            // 5. Poll for status
-            const pollInterval = setInterval(async () => {
-                const status = await api(`job/${start.job_id}`);
-
-                if (status.status === 'running') {
-                    const phaseText = status.phases > 1 ? `Phase ${status.phase}/${status.phases}: ` : '';
-                    const speedText = status.speed ? ` (${status.speed})` : '';
-                    let phaseAction = operation === 'move' ? 'Moving' : 'Copying';
-                    if (status.phases > 1) {
-                        phaseAction = status.phase === 1 ? 'Downloading' : 'Uploading';
-                    }
-
-                    progressFill.style.width = status.progress + '%';
-                    progressText.textContent = `${phaseText}${phaseAction}... ${status.progress}%${speedText}`;
-
+            const poll = setInterval(async () => {
+                const s = await api(`job/${jobId}`);
+                if (s.status === 'running') {
+                    const phase = s.phases > 1 ? `Phase ${s.phase}/${s.phases}: ` : '';
+                    const speed = s.speed ? ` (${s.speed})` : '';
+                    progressFill.style.width = s.progress + '%';
+                    progressText.textContent = `${phase}${action}... ${s.progress}%${speed}`;
                 } else {
-                    clearInterval(pollInterval);
+                    clearInterval(poll);
                     progressEl.classList.remove('visible');
                     fmState.busy = false;
                     fmUpdateButtons();
-
-                    if (status.status === 'complete') {
-                        toast(operation === 'move' ? 'Moved successfully' : 'Copied successfully');
-                        fromState.selected.clear();
-                        fmLoadFiles(fromPane);
-                        fmLoadFiles(toPane);
-                    } else {
-                        toast(status.error || 'Transfer failed', 'error');
-                    }
+                    if (s.status === 'complete') onComplete();
+                    else toast(s.error || 'Transfer failed', 'error');
                 }
             }, 1000);
         }
@@ -6976,6 +7997,55 @@ HTML_PAGE = '''<!DOCTYPE html>
 
             fmState.busy = false;
             fmUpdateButtons();
+        }
+
+        async function fmExtract() {
+            const srcPane = fmState.left.selected.size > 0 ? 'left' : 'right';
+            const destPane = srcPane === 'left' ? 'right' : 'left';
+            const srcState = fmState[srcPane];
+            const destState = fmState[destPane];
+
+            const idx = Array.from(srcState.selected)[0];
+            const file = srcState.files[idx];
+            const archivePath = srcState.path === '/' ? `/${file.name}` : `${srcState.path}/${file.name}`;
+
+            fmState.busy = true;
+            fmUpdateButtons();
+            toast('Extracting...');
+
+            try {
+                const res = await api(`device/${srcState.device}/files`, 'POST', {
+                    operation: 'extract',
+                    paths: [archivePath],
+                    dest_device: destState.device,
+                    dest_path: destState.path
+                });
+
+                if (!res.success) {
+                    toast(res.error || 'Extract failed', 'error');
+                    fmState.busy = false;
+                    fmUpdateButtons();
+                    return;
+                }
+
+                if (res.transfer && res.job_id) {
+                    fmPollJob(res.job_id, 'Extracting', () => {
+                        toast('Extracted');
+                        srcState.selected.clear();
+                        fmLoadFiles(destPane);
+                    });
+                } else {
+                    toast('Extracted');
+                    srcState.selected.clear();
+                    fmLoadFiles(destPane);
+                    fmState.busy = false;
+                    fmUpdateButtons();
+                }
+            } catch (e) {
+                toast('Extract failed', 'error');
+                fmState.busy = false;
+                fmUpdateButtons();
+            }
         }
 
         function fmDownload() {
@@ -7790,22 +8860,24 @@ HTML_PAGE = '''<!DOCTYPE html>
 </html>'''
 
 # PWA Manifest
-MANIFEST_JSON = json.dumps({
-    "name": "DeQ",
-    "short_name": "DeQ",
-    "description": "Homelab Dashboard",
-    "start_url": "/",
-    "display": "standalone",
-    "background_color": "#0a0a0a",
-    "theme_color": "#0a0a0a",
-    "orientation": "any",
-    "icons": [
-        {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
-    ]
-})
+def get_manifest_json():
+    return json.dumps({
+        "name": "DeQ",
+        "short_name": "DeQ",
+        "description": "Homelab Dashboard",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0a0a0a",
+        "theme_color": "#0a0a0a",
+        "orientation": "any",
+        "icons": [
+            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+        ]
+    })
 
 # Icon
-ICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+def get_icon_svg():
+    return '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <rect width="512" height="512" fill="#0a0a0a"/>
   <!-- D -->
   <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="#e0e0e0" stroke-width="16"/>
@@ -7816,992 +8888,6 @@ ICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <path d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke="#2ed573" stroke-width="16" stroke-linecap="round"/>
   <line x1="405" y1="405" x2="435" y2="435" stroke="#2ed573" stroke-width="16" stroke-linecap="round"/>
 </svg>'''
-
-# === TASK EXECUTION ===
-def log_task(task_id, message):
-    """Append a log line to the task's log file."""
-    log_file = f"{TASK_LOGS_DIR}/{task_id}.log"
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(log_file, 'a') as f:
-        f.write(f"[{timestamp}] {message}\n")
-
-# Track running tasks
-running_tasks = {}
-
-def run_task_async(task_id):
-    """Execute a task in a background thread."""
-    global CONFIG, running_tasks
-
-    task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
-    if not task:
-        return
-
-    task_type = task.get('type', 'backup')
-    log_task(task_id, f"Starting {task_type} task: {task.get('name', 'unnamed')}")
-
-    try:
-        if task_type == 'backup':
-            result = run_backup_task(task)
-        elif task_type == 'wake':
-            result = run_wake_task(task)
-        elif task_type == 'shutdown':
-            result = run_shutdown_task(task)
-        elif task_type == 'suspend':
-            result = run_suspend_task(task)
-        elif task_type == 'script':
-            result = run_script_task(task)
-        else:
-            result = {"success": False, "error": f"Unknown task type: {task_type}"}
-
-        # Update task status
-        task['last_run'] = datetime.now().isoformat()
-        if result.get('success'):
-            task['last_status'] = 'success'
-            task['last_error'] = None
-            if 'size' in result:
-                task['last_size'] = result['size']
-            log_task(task_id, f"Completed successfully")
-        elif result.get('skipped'):
-            task['last_status'] = 'skipped'
-            task['last_error'] = result.get('error', 'source offline')
-            log_task(task_id, f"Skipped: {task['last_error']}")
-        else:
-            task['last_status'] = 'failed'
-            task['last_error'] = result.get('error', 'unknown error')
-            log_task(task_id, f"Failed: {task['last_error']}")
-
-        save_config(CONFIG)
-
-    except Exception as e:
-        task['last_run'] = datetime.now().isoformat()
-        task['last_status'] = 'failed'
-        task['last_error'] = str(e)
-        save_config(CONFIG)
-        log_task(task_id, f"Exception: {e}")
-
-    finally:
-        running_tasks.pop(task_id, None)
-
-
-def run_task(task_id):
-    """Start a task in background thread, return immediately."""
-    global CONFIG, running_tasks
-
-    task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
-    if not task:
-        return {"success": False, "error": "Task not found"}
-
-    if task_id in running_tasks:
-        return {"success": False, "error": "Task already running"}
-
-    # Start in background thread
-    running_tasks[task_id] = True
-    thread = threading.Thread(target=run_task_async, args=(task_id,), daemon=True)
-    thread.start()
-
-    return {"success": True, "started": True}
-
-def run_backup_task(task):
-    """Execute a backup task using rsync."""
-    source = task.get('source', {})
-    dest = task.get('dest', {})
-    options = task.get('options', {})
-
-    source_device = next((d for d in CONFIG['devices'] if d['id'] == source.get('device')), None)
-    dest_device = next((d for d in CONFIG['devices'] if d['id'] == dest.get('device')), None)
-
-    if not source_device or not dest_device:
-        return {"success": False, "error": "Source or destination device not found"}
-
-    source_path = source.get('path', '')
-    dest_path = dest.get('path', '')
-
-    if not source_path or not dest_path:
-        return {"success": False, "error": "Source or destination path not specified"}
-
-    # Check if source device is online
-    source_is_host = source_device.get('is_host', False)
-    if not source_is_host:
-        if not ping_host(source_device['ip']):
-            return {"success": False, "skipped": True, "error": "source offline"}
-
-    # Build rsync command
-    rsync_opts = ["-avz", "--stats"]
-    if options.get('delete'):
-        rsync_opts.append("--delete")
-
-    # Source path - respect user's trailing slash choice
-    if source_is_host:
-        rsync_source = source_path
-    else:
-        ssh_user = source_device.get('ssh', {}).get('user', 'root')
-        ssh_port = source_device.get('ssh', {}).get('port', 22)
-        rsync_opts.extend(["-e", f"ssh {SSH_CONTROL_STR} -p {ssh_port} -o StrictHostKeyChecking=no -o ConnectTimeout=10"])
-        rsync_source = f"{ssh_user}@{source_device['ip']}:{source_path}"
-
-    # Destination path - respect user's trailing slash choice
-    dest_is_host = dest_device.get('is_host', False)
-    if dest_is_host:
-        # Ensure destination directory exists
-        os.makedirs(dest_path, exist_ok=True)
-        rsync_dest = dest_path
-    else:
-        ssh_user = dest_device.get('ssh', {}).get('user', 'root')
-        ssh_port = dest_device.get('ssh', {}).get('port', 22)
-        if "-e" not in rsync_opts:
-            rsync_opts.extend(["-e", f"ssh {SSH_CONTROL_STR} -p {ssh_port} -o StrictHostKeyChecking=no -o ConnectTimeout=10"])
-        rsync_dest = f"{ssh_user}@{dest_device['ip']}:{dest_path}"
-
-    cmd = ["rsync"] + rsync_opts + [rsync_source, rsync_dest]
-    log_task(task['id'], f"Running: {' '.join(cmd)}")
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-
-        if result.returncode == 0:
-            # Parse total size from rsync stats
-            size = ""
-            for line in result.stdout.split('\n'):
-                if 'Total file size' in line and 'transferred' not in line:
-                    parts = line.split(':')
-                    if len(parts) > 1:
-                        size = parts[1].strip().split()[0]
-                        # Convert to human readable
-                        try:
-                            # Remove thousand separators (comma or dot)
-                            bytes_val = int(size.replace(',', '').replace('.', ''))
-                            if bytes_val >= 1e9:
-                                size = f"{bytes_val/1e9:.1f}GB"
-                            elif bytes_val >= 1e6:
-                                size = f"{bytes_val/1e6:.0f}MB"
-                            else:
-                                size = f"{bytes_val/1e3:.0f}KB"
-                        except:
-                            pass
-            return {"success": True, "size": size}
-        else:
-            return {"success": False, "error": result.stderr[:200] if result.stderr else "rsync failed"}
-
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "timeout (1h)"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def run_wake_task(task):
-    """Execute a wake task - WOL for device, docker start for container."""
-    target = task.get('target', 'device')
-
-    if target == 'docker':
-        container = task.get('container')
-        if not container:
-            return {"success": False, "error": "No container specified"}
-        return docker_action(container, 'start')
-
-    # Device wake (WOL)
-    device_id = task.get('device') or task.get('source', {}).get('device')  # backward compat
-    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
-
-    if not device:
-        return {"success": False, "error": "Device not found"}
-
-    if not device.get('wol', {}).get('mac'):
-        return {"success": False, "error": "Device has no WOL configured"}
-
-    result = send_wol(device['wol']['mac'], device['wol'].get('broadcast', '255.255.255.255'))
-    return result
-
-
-def run_shutdown_task(task):
-    """Execute a shutdown task - SSH shutdown for device, docker stop for container."""
-    target = task.get('target', 'device')
-
-    if target == 'docker':
-        container = task.get('container')
-        if not container:
-            return {"success": False, "error": "No container specified"}
-        return docker_action(container, 'stop')
-
-    # Device shutdown
-    device_id = task.get('device')
-    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
-
-    if not device:
-        return {"success": False, "error": "Device not found"}
-
-    # Host device: local shutdown
-    if device.get('is_host'):
-        try:
-            subprocess.Popen(["sudo", "shutdown", "-h", "now"])
-            return {"success": True}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    # Remote device: SSH shutdown
-    if not device.get('ssh', {}).get('user'):
-        return {"success": False, "error": "Device has no SSH configured"}
-
-    result = ssh_shutdown(device['ip'], device['ssh']['user'], device['ssh'].get('port', 22))
-    return result
-
-def run_suspend_task(task):
-    """Execute a suspend task - SSH suspend for device (no docker equivalent)."""
-    device_id = task.get('device')
-    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
-
-    if not device:
-        return {"success": False, "error": "Device not found"}
-
-    # Host device: local suspend
-    if device.get('is_host'):
-        try:
-            subprocess.Popen(["sudo", "systemctl", "suspend"])
-            return {"success": True}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    # Remote device: SSH suspend
-    if not device.get('ssh', {}).get('user'):
-        return {"success": False, "error": "Device has no SSH configured"}
-
-    result = ssh_suspend(device['ip'], device['ssh']['user'], device['ssh'].get('port', 22))
-    return result
-
-def run_script_task(task):
-    """Start a scheduled script."""
-    script_path = task.get('script')
-    if not script_path:
-        return {"success": False, "error": "No script specified"}
-    return execute_quick_action(script_path)
-
-
-# === TASK SCHEDULER ===
-def calculate_next_run(task):
-    """Calculate the next run time for a task based on its schedule."""
-    if not task.get('enabled', True):
-        return None
-
-    schedule = task.get('schedule', {})
-    schedule_type = schedule.get('type', 'daily')
-    time_str = schedule.get('time', '03:00')
-
-    try:
-        hour, minute = map(int, time_str.split(':'))
-    except Exception:
-        hour, minute = 3, 0
-
-    now = datetime.now()
-
-    if schedule_type == 'hourly':
-        # Run every hour at specified minute
-        next_run = now.replace(minute=minute, second=0, microsecond=0)
-        if next_run <= now:
-            next_run += timedelta(hours=1)
-
-    elif schedule_type == 'daily':
-        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if next_run <= now:
-            next_run += timedelta(days=1)
-
-    elif schedule_type == 'weekly':
-        day = schedule.get('day', 0)  # 0 = Sunday
-        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        # Convert to Python weekday (0=Monday)
-        py_day = (day - 1) % 7 if day > 0 else 6
-        days_ahead = py_day - now.weekday()
-        if days_ahead < 0 or (days_ahead == 0 and next_run <= now):
-            days_ahead += 7
-        next_run += timedelta(days=days_ahead)
-
-    elif schedule_type == 'monthly':
-        date = schedule.get('date', 1)
-        # Try current month first
-        year, month = now.year, now.month
-        for _ in range(12):  # Try up to 12 months ahead
-            try:
-                next_run = datetime(year, month, date, hour, minute, 0)
-                if next_run > now:
-                    break
-                # Move to next month
-                month += 1
-                if month > 12:
-                    month = 1
-                    year += 1
-            except ValueError:
-                # Invalid day for this month (e.g., Feb 30), try next month
-                month += 1
-                if month > 12:
-                    month = 1
-                    year += 1
-        else:
-            return None  # Could not find valid date
-    else:
-        return None
-
-    return next_run.isoformat()
-
-
-class TaskScheduler:
-    """Background scheduler for automated task execution."""
-
-    def __init__(self):
-        self.running = False
-        self.thread = None
-
-    def start(self):
-        """Start the scheduler thread."""
-        if self.running:
-            return
-        self.running = True
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-        print("Task scheduler started")
-
-    def stop(self):
-        """Stop the scheduler thread."""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=5)
-        print("Task scheduler stopped")
-
-    def _run(self):
-        """Main scheduler loop - checks every 60 seconds for due tasks."""
-        # Update next_run times on startup
-        self._update_next_runs()
-
-        while self.running:
-            try:
-                self._check_and_run_tasks()
-            except Exception as e:
-                print(f"Scheduler error: {e}")
-
-            # Sleep for 60 seconds, but check running flag periodically
-            for _ in range(60):
-                if not self.running:
-                    break
-                time.sleep(1)
-
-    def _update_next_runs(self):
-        """Update next_run times for all tasks, preserving valid future times."""
-        global CONFIG
-        changed = False
-        now = datetime.now()
-        for task in CONFIG.get('tasks', []):
-            if task.get('enabled', True):
-                current_next = task.get('next_run')
-                if current_next:
-                    try:
-                        next_dt = datetime.fromisoformat(current_next)
-                        if next_dt > now:
-                            continue
-                    except:
-                        pass
-                next_run = calculate_next_run(task)
-                if next_run != current_next:
-                    task['next_run'] = next_run
-                    changed = True
-        if changed:
-            save_config(CONFIG)
-
-    def _check_and_run_tasks(self):
-        """Check for tasks due to run and execute them."""
-        global CONFIG
-        now = datetime.now()
-
-        for task in CONFIG.get('tasks', []):
-            if not task.get('enabled', True):
-                continue
-
-            next_run_str = task.get('next_run')
-            if not next_run_str:
-                # Calculate and set next_run if missing
-                task['next_run'] = calculate_next_run(task)
-                save_config(CONFIG)
-                continue
-
-            try:
-                next_run = datetime.fromisoformat(next_run_str)
-            except:
-                continue
-
-            if now >= next_run:
-                print(f"Running scheduled task: {task.get('name', task['id'])}")
-                run_task(task['id'])
-
-                # Calculate next run time
-                task['next_run'] = calculate_next_run(task)
-                save_config(CONFIG)
-
-
-# Global scheduler instance
-task_scheduler = TaskScheduler()
-
-
-class RequestHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        print(f"[{self.log_date_time_string()}] {args[0]}")
-    
-    def send_json(self, data, status=200):
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-    
-    def send_html(self, html):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
-        self.end_headers()
-        self.wfile.write(html.encode())
-    
-    def send_file(self, content, content_type, cache=True):
-        self.send_response(200)
-        self.send_header('Content-Type', content_type)
-        if cache:
-            self.send_header('Cache-Control', 'public, max-age=31536000')
-        self.end_headers()
-        if isinstance(content, str):
-            self.wfile.write(content.encode())
-        else:
-            self.wfile.write(content)
-
-    def get_session_cookie(self):
-        """Get session token from cookie."""
-        cookie_header = self.headers.get('Cookie', '')
-        cookie = SimpleCookie()
-        cookie.load(cookie_header)
-        if SESSION_COOKIE_NAME in cookie:
-            return cookie[SESSION_COOKIE_NAME].value
-        return None
-
-    def is_authenticated(self):
-        """Check if request is authenticated."""
-        if not is_auth_enabled():
-            return True
-        token = self.get_session_cookie()
-        return verify_session_token(token)
-
-    def send_login_page(self):
-        """Send login page HTML."""
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
-        self.end_headers()
-        self.wfile.write(LOGIN_PAGE.encode())
-
-    def do_GET(self):
-        path = urlparse(self.path).path
-        query = parse_qs(urlparse(self.path).query)
-
-        # Static files don't require auth
-        if path in ['/manifest.json', '/icon.svg'] or path.startswith('/fonts/'):
-            pass  # Continue to serve static files
-        elif not self.is_authenticated():
-            self.send_login_page()
-            return
-
-        if path == '/' or path == '':
-            needs_onboarding = not CONFIG.get('onboarding_done') and len(CONFIG.get('devices', [])) <= 1
-            html = HTML_PAGE.replace('__NEEDS_ONBOARDING__', 'true' if needs_onboarding else 'false')
-            self.send_html(html)
-            return
-        
-        if path == '/manifest.json':
-            self.send_file(MANIFEST_JSON, 'application/manifest+json')
-            return
-        
-        if path == '/icon.svg':
-            self.send_file(ICON_SVG, 'image/svg+xml')
-            return
-
-        if path.startswith('/fonts/'):
-            font_name = path.split('/')[-1]
-            # Try local fonts dir first (bundled), then DATA_DIR
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            font_paths = [
-                os.path.join(script_dir, 'fonts', font_name),
-                f"{DATA_DIR}/fonts/{font_name}"
-            ]
-            for font_path in font_paths:
-                if os.path.exists(font_path):
-                    with open(font_path, 'rb') as f:
-                        self.send_file(f.read(), 'font/woff2')
-                    return
-            self.send_response(404)
-            self.end_headers()
-            return
-        
-        # API
-        if path.startswith('/api/'):
-            api_path = path[5:].split('?')[0]
-            
-            if api_path == 'config':
-                self.send_json({"success": True, "config": get_config_with_defaults(), "running_tasks": list(running_tasks.keys()), "auth_enabled": is_auth_enabled()})
-                return
-            
-            if api_path == 'stats/host':
-                self.send_json({"success": True, "stats": get_local_stats()})
-                return
-
-            if api_path == 'health':
-                health = get_health_status()
-                self.send_json(health)
-                return
-
-            if api_path == 'version':
-                self.send_json({"version": VERSION, "name": "DeQ"})
-                return
-
-            if api_path == 'network/scan':
-                result = scan_network()
-                self.send_json(result)
-                return
-
-            if api_path == 'scripts/scan':
-                scripts = discover_scripts()
-                self.send_json({"success": True, "scripts": scripts})
-                return
-
-            if api_path.startswith('job/'):
-                job_id = api_path.split('/')[1]
-                status = get_job_status(job_id)
-                self.send_json(status)
-                return
-
-            if api_path.startswith('quick-action/') and api_path.endswith('/run'):
-                parts = api_path.split('/')
-                qa_id = parts[1]
-                qa = next((q for q in CONFIG.get('quick_actions', []) if q['id'] == qa_id), None)
-                if not qa:
-                    self.send_json({"success": False, "error": "Quick action not found"}, 404)
-                    return
-                result = execute_quick_action(qa['path'])
-                self.send_json(result)
-                return
-
-            if api_path.startswith('device/'):
-                parts = api_path.split('/')
-                if len(parts) >= 3:
-                    dev_id = parts[1]
-                    action = parts[2]
-                    dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
-                    
-                    if not dev:
-                        self.send_json({"success": False, "error": "Device not found"}, 404)
-                        return
-                    
-                    if action == 'scan-containers':
-                        result = scan_docker_containers(dev)
-                        self.send_json(result)
-                        return
-
-                    if action == 'ssh-check':
-                        ssh_config = dev.get('ssh', {})
-                        if not ssh_config.get('user'):
-                            self.send_json({"success": False, "error": "No SSH user configured"})
-                            return
-                        try:
-                            result = subprocess.run(
-                                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                                 "-p", str(ssh_config.get('port', 22)), f"{ssh_config['user']}@{dev['ip']}", "echo ok"],
-                                capture_output=True, text=True, timeout=10
-                            )
-                            if result.returncode == 0 and 'ok' in result.stdout:
-                                self.send_json({"success": True})
-                            else:
-                                self.send_json({"success": False, "error": "SSH auth failed"})
-                        except subprocess.TimeoutExpired:
-                            self.send_json({"success": False, "error": "SSH timeout"})
-                        except Exception as e:
-                            self.send_json({"success": False, "error": str(e)})
-                        return
-
-                    if action == 'status':
-                        cached = get_cached_status(dev_id)
-                        refresh_device_status_async(dev)
-                        if cached:
-                            self.send_json({"success": True, **cached})
-                        else:
-                            self.send_json({"success": True, "online": None, "stats": None, "containers": {}})
-                        return
-
-                    if action == 'stats':
-                        if dev.get('is_host'):
-                            stats = get_local_stats()
-                            online = True
-                        else:
-                            online = ping_host(dev.get('ip', ''))
-                            ssh = dev.get('ssh', {})
-                            if online and ssh.get('user'):
-                                stats = get_remote_stats(dev['ip'], ssh['user'], ssh.get('port', 22))
-                            else:
-                                stats = None
-                        self.send_json({"success": True, "stats": stats or {}, "online": online})
-                        return
-
-                    if action == 'wake':
-                        if dev.get('wol', {}).get('mac'):
-                            result = send_wol(dev['wol']['mac'], dev['wol'].get('broadcast', '255.255.255.255'))
-                            self.send_json(result)
-                        else:
-                            self.send_json({"success": False, "error": "WOL not configured"})
-                        return
-                    
-                    if action == 'shutdown':
-                        # Host device: local shutdown
-                        if dev.get('is_host'):
-                            try:
-                                subprocess.Popen(["sudo", "shutdown", "-h", "now"])
-                                self.send_json({"success": True})
-                            except Exception as e:
-                                self.send_json({"success": False, "error": str(e)})
-                            return
-
-                        if dev.get('ssh', {}).get('user'):
-                            result = ssh_shutdown(dev['ip'], dev['ssh']['user'], dev['ssh'].get('port', 22))
-                            self.send_json(result)
-                        else:
-                            self.send_json({"success": False, "error": "SSH not configured"})
-                        return
-
-                    if action == 'suspend':
-                        # Host device: local suspend
-                        if dev.get('is_host'):
-                            try:
-                                subprocess.Popen(["sudo", "systemctl", "suspend"])
-                                self.send_json({"success": True})
-                            except Exception as e:
-                                self.send_json({"success": False, "error": str(e)})
-                            return
-
-                        if dev.get('ssh', {}).get('user'):
-                            result = ssh_suspend(dev['ip'], dev['ssh']['user'], dev['ssh'].get('port', 22))
-                            self.send_json(result)
-                        else:
-                            self.send_json({"success": False, "error": "SSH not configured"})
-                        return
-                    
-                    # Docker: /api/device/{id}/docker/{container}/{action}
-                    if action == 'docker' and len(parts) >= 5:
-                        container_name = parts[3]
-                        docker_act = parts[4]
-
-                        if not is_valid_container_name(container_name):
-                            self.send_json({"success": False, "error": "Invalid container name"})
-                            return
-
-                        containers = dev.get('docker', {}).get('containers', [])
-                        container_names = [c.get('name') if isinstance(c, dict) else c for c in containers]
-
-                        if container_name not in container_names:
-                            self.send_json({"success": False, "error": f"Container '{container_name}' not configured"})
-                            return
-
-                        if dev.get('is_host'):
-                            result = docker_action(container_name, docker_act)
-                        else:
-                            ssh_config = dev.get('ssh', {})
-                            if ssh_config.get('user'):
-                                result = remote_docker_action(
-                                    dev['ip'],
-                                    ssh_config['user'],
-                                    ssh_config.get('port', 22),
-                                    container_name,
-                                    docker_act
-                                )
-                            else:
-                                result = {"success": False, "error": "SSH not configured"}
-
-                        self.send_json(result)
-                        return
-
-                    # Browse folders: /api/device/{id}/browse?path=/
-                    if action == 'browse':
-                        browse_path = query.get('path', ['/'])[0]
-                        result = browse_folder(dev, browse_path)
-                        self.send_json(result)
-                        return
-
-                    # List files: /api/device/{id}/files?path=/
-                    if action == 'files':
-                        file_path = query.get('path', ['/'])[0]
-                        result = list_files(dev, file_path)
-                        self.send_json(result)
-                        return
-
-                    # Download file: /api/device/{id}/download?path=/file.txt
-                    if action == 'download':
-                        file_path = query.get('path', [''])[0]
-                        if not file_path:
-                            self.send_json({"success": False, "error": "Path required"}, 400)
-                            return
-                        content, filename, error = get_file_for_download(dev, file_path)
-                        if error:
-                            self.send_json({"success": False, "error": error}, 400)
-                            return
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'application/octet-stream')
-                        self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
-                        self.send_header('Content-Length', len(content))
-                        self.end_headers()
-                        self.wfile.write(content)
-                        return
-
-            # Task status (check if running)
-            if api_path.startswith('task/') and api_path.endswith('/status'):
-                task_id = api_path.split('/')[1]
-                is_running = task_id in running_tasks
-                task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
-                if task:
-                    self.send_json({
-                        "success": True,
-                        "running": is_running,
-                        "last_status": task.get('last_status'),
-                        "last_error": task.get('last_error'),
-                        "last_size": task.get('last_size')
-                    })
-                else:
-                    self.send_json({"success": False, "error": "Task not found"}, 404)
-                return
-
-            self.send_json({"success": False, "error": "Not found"}, 404)
-            return
-
-        self.send_response(404)
-        self.end_headers()
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-
-        # Auth endpoints (no auth required for login)
-        if path == '/auth/login':
-            length = int(self.headers.get('Content-Length', 0))
-            data = json.loads(self.rfile.read(length)) if length > 0 else {}
-            password = data.get('password', '')
-            if verify_password(password):
-                token = create_session_token()
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Set-Cookie', f'{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict')
-                self.end_headers()
-                self.wfile.write(json.dumps({"success": True}).encode())
-            else:
-                self.send_json({"success": False, "error": "Invalid password"}, 401)
-            return
-
-        if path == '/auth/logout':
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Set-Cookie', f'{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0')
-            self.end_headers()
-            self.wfile.write(json.dumps({"success": True}).encode())
-            return
-
-        # All other POST requests require auth
-        if not self.is_authenticated():
-            self.send_json({"success": False, "error": "Unauthorized"}, 401)
-            return
-
-        if path == '/api/config':
-            length = int(self.headers.get('Content-Length', 0))
-            data = json.loads(self.rfile.read(length))
-            global CONFIG
-            CONFIG = data
-            # Update next_run for all enabled tasks
-            for task in CONFIG.get('tasks', []):
-                if task.get('enabled', True):
-                    task['next_run'] = calculate_next_run(task)
-            save_config(CONFIG)
-            self.send_json({"success": True})
-            return
-
-        if path == '/api/onboarding/complete':
-            CONFIG['onboarding_done'] = True
-            save_config(CONFIG)
-            self.send_json({"success": True})
-            return
-
-        # Task execution
-        if path.startswith('/api/task/') and path.endswith('/run'):
-            task_id = path.split('/')[3]
-            result = run_task(task_id)
-            self.send_json(result)
-            return
-
-        # Task toggle (pause/resume)
-        if path.startswith('/api/task/') and path.endswith('/toggle'):
-            task_id = path.split('/')[3]
-            for task in CONFIG.get('tasks', []):
-                if task['id'] == task_id:
-                    task['enabled'] = not task.get('enabled', True)
-                    if task['enabled']:
-                        task['next_run'] = calculate_next_run(task)
-                    save_config(CONFIG)
-                    self.send_json({"success": True, "enabled": task['enabled']})
-                    return
-            self.send_json({"success": False, "error": "Task not found"}, 404)
-            return
-
-        # File operations: /api/device/{id}/files
-        if path.startswith('/api/device/') and path.endswith('/files'):
-            parts = path.split('/')
-            dev_id = parts[3]
-            dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
-
-            if not dev:
-                self.send_json({"success": False, "error": "Device not found"}, 404)
-                return
-
-            length = int(self.headers.get('Content-Length', 0))
-            data = json.loads(self.rfile.read(length))
-            operation = data.get('operation')
-            paths = data.get('paths', [])
-
-            if operation in ('copy', 'move', 'preflight'):
-                dest_dev_id = data.get('dest_device')
-                dest_path = data.get('dest_path')
-                dest_dev = next((d for d in CONFIG['devices'] if d['id'] == dest_dev_id), None)
-                if not dest_dev:
-                    self.send_json({"success": False, "error": "Destination device not found"}, 404)
-                    return
-                result = file_operation(dev, operation, paths, dest_device=dest_dev, dest_path=dest_path)
-            elif operation == 'rename':
-                new_name = data.get('new_name')
-                result = file_operation(dev, operation, paths, new_name=new_name)
-            elif operation == 'mkdir':
-                new_name = data.get('new_name')
-                result = file_operation(dev, operation, paths, new_name=new_name)
-            elif operation in ('delete', 'zip'):
-                result = file_operation(dev, operation, paths)
-            else:
-                result = {"success": False, "error": f"Unknown operation: {operation}"}
-
-            self.send_json(result)
-            return
-
-        # File upload: /api/device/{id}/upload?path=/dest/folder
-        if path.startswith('/api/device/') and '/upload' in path:
-            parts = path.split('/')
-            dev_id = parts[3]
-            dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
-
-            if not dev:
-                self.send_json({"success": False, "error": "Device not found"}, 404)
-                return
-
-            parsed = urlparse(self.path)
-            query = parse_qs(parsed.query)
-            dest_path = query.get('path', ['/'])[0]
-
-            # Parse multipart form data
-            content_type = self.headers.get('Content-Type', '')
-            if 'multipart/form-data' not in content_type:
-                self.send_json({"success": False, "error": "Expected multipart/form-data"}, 400)
-                return
-
-            # Extract boundary
-            boundary = None
-            for part in content_type.split(';'):
-                part = part.strip()
-                if part.startswith('boundary='):
-                    boundary = part[9:].strip('"')
-                    break
-
-            if not boundary:
-                self.send_json({"success": False, "error": "No boundary in multipart"}, 400)
-                return
-
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length)
-
-            # Parse multipart - simple parser for single file
-            boundary_bytes = ('--' + boundary).encode()
-            parts = body.split(boundary_bytes)
-
-            uploaded = 0
-            errors = []
-
-            for part in parts:
-                if b'Content-Disposition: form-data;' not in part:
-                    continue
-                if b'filename="' not in part:
-                    continue
-
-                # Extract filename
-                header_end = part.find(b'\r\n\r\n')
-                if header_end == -1:
-                    continue
-                header = part[:header_end].decode('utf-8', errors='ignore')
-                content = part[header_end + 4:]
-
-                # Remove trailing \r\n--
-                if content.endswith(b'\r\n'):
-                    content = content[:-2]
-                if content.endswith(b'--'):
-                    content = content[:-2]
-                if content.endswith(b'\r\n'):
-                    content = content[:-2]
-
-                # Get filename from header
-                import re
-                match = re.search(r'filename="([^"]+)"', header)
-                if not match:
-                    continue
-                filename = match.group(1)
-
-                # Upload file
-                result = upload_file(dev, dest_path, filename, content)
-                if result['success']:
-                    uploaded += 1
-                else:
-                    errors.append(f"{filename}: {result['error']}")
-
-            if errors:
-                self.send_json({"success": False, "error": "; ".join(errors), "uploaded": uploaded})
-            else:
-                self.send_json({"success": True, "uploaded": uploaded})
-            return
-
-        self.send_json({"success": False, "error": "Not found"}, 404)
-
-
-def main():
-    parser = argparse.ArgumentParser(description='DeQ - Homelab Dashboard')
-    parser.add_argument('--port', type=int, default=DEFAULT_PORT, help=f'Port to run on (default: {DEFAULT_PORT})')
-    args = parser.parse_args()
-
-    port = args.port
-
-    print(f"""
-================================================================
-              DeQ - Homelab Admin Panel
-================================================================
-  Version: {VERSION}
-  Port:    {port}
-
-  Access URL:
-  http://YOUR-IP:{port}/
-================================================================
-    """)
-
-    # Clean up stale SSH ControlMaster sockets from previous runs
-    for socket_file in glob.glob("/tmp/deq-ssh-*"):
-        try:
-            os.remove(socket_file)
-        except OSError:
-            pass
-
-    # Start task scheduler
-    task_scheduler.start()
-
-    server = HTTPServer(('0.0.0.0', port), RequestHandler)
-    print(f"Server running on port {port}...")
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-        task_scheduler.stop()
-        server.shutdown()
-
 
 if __name__ == '__main__':
     main()
