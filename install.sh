@@ -2,8 +2,90 @@
 #
 # DeQ - Installation Script
 #
+# Usage:
+#   ./install.sh              # Full installation
+#   ./install.sh --set-password    # Set/change admin password
+#   ./install.sh --remove-password # Remove password (disable auth)
+#
 
 set -e
+
+DATA_DIR="/opt/deq"
+
+# Password management functions
+set_password() {
+    echo ""
+    read -s -p "Enter admin password: " password1
+    echo ""
+    read -s -p "Confirm password: " password2
+    echo ""
+
+    if [ "$password1" != "$password2" ]; then
+        echo "[ERROR] Passwords do not match"
+        exit 1
+    fi
+
+    if [ -z "$password1" ]; then
+        echo "[ERROR] Password cannot be empty"
+        exit 1
+    fi
+
+    hash=$(echo -n "$password1" | python3 -c "
+import hashlib, secrets, sys
+password = sys.stdin.buffer.read().decode('utf-8')
+salt = secrets.token_bytes(16)
+key = hashlib.scrypt(password.encode('utf-8'), salt=salt, n=16384, r=8, p=1, dklen=32)
+print(salt.hex() + ':' + key.hex())
+")
+
+    echo "$hash" > "$DATA_DIR/.password"
+    chmod 600 "$DATA_DIR/.password"
+
+    # Invalidate all sessions
+    rm -f "$DATA_DIR/.session_secret"
+
+    # Restart service if running
+    if systemctl is-active --quiet deq; then
+        systemctl restart deq
+        echo "[OK] Password set. Service restarted."
+    else
+        echo "[OK] Password set."
+    fi
+    echo ""
+}
+
+remove_password() {
+    rm -f "$DATA_DIR/.password"
+    rm -f "$DATA_DIR/.session_secret"
+
+    # Restart service if running
+    if systemctl is-active --quiet deq; then
+        systemctl restart deq
+        echo "[OK] Password removed. Service restarted."
+    else
+        echo "[OK] Password removed. Authentication disabled."
+    fi
+    echo ""
+}
+
+# Handle --set-password and --remove-password
+if [ "$1" = "--set-password" ]; then
+    if [ "$EUID" -ne 0 ]; then
+        echo "[ERROR] Please run as root (sudo ./install.sh --set-password)"
+        exit 1
+    fi
+    set_password
+    exit 0
+fi
+
+if [ "$1" = "--remove-password" ]; then
+    if [ "$EUID" -ne 0 ]; then
+        echo "[ERROR] Please run as root (sudo ./install.sh --remove-password)"
+        exit 1
+    fi
+    remove_password
+    exit 0
+fi
 
 echo "================================================================"
 echo "              DeQ - Admin Dashboard Installer                   "
@@ -46,6 +128,7 @@ echo "Installing to /opt/deq..."
 # Create directories
 mkdir -p /opt/deq/fonts
 mkdir -p /opt/deq/history
+mkdir -p /opt/deq/scripts
 
 # Copy files
 cp server.py /opt/deq/
@@ -102,7 +185,7 @@ EOFCONFIG
     echo "[OK] Initial config created with host IP: $SERVER_IP"
 fi
 
-systemctl start deq
+systemctl restart deq
 
 # Wait for service to start
 sleep 2

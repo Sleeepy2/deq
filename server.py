@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 DeQ - Alles schläft, einer wacht.
-A mighty pocket rocket for your homelab. Breaking conventions - single file, no Docker, raw control.
-Control devices, view stats, manage links and files - all in one place.
 USE BEHIND VPN ONLY! DO NOT EXPOSE TO PUBLIC INTERNET!
 
 """
@@ -15,15 +13,375 @@ import time
 import threading
 import argparse
 import re
+import glob
+import shutil
+import random
+import shlex
+import hashlib
+import secrets
+import hmac
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from http.cookies import SimpleCookie
 # === CONFIGURATION ===
 DEFAULT_PORT = 5050
 DATA_DIR = "/opt/deq"
 CONFIG_FILE = f"{DATA_DIR}/config.json"
-HISTORY_DIR = f"{DATA_DIR}/history"
-VERSION = "0.9.5"
+SCRIPTS_DIR = f"{DATA_DIR}/scripts"
+PASSWORD_FILE = f"{DATA_DIR}/.password"
+SESSION_SECRET_FILE = f"{DATA_DIR}/.session_secret"
+SESSION_COOKIE_NAME = "deq_session"
+VERSION = "0.9.11"
+
+# SSH ControlMaster for connection reuse (reduces overhead when File Manager makes many SSH calls)
+SSH_CONTROL_OPTS = ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/deq-ssh-%r@%h:%p", "-o", "ControlPersist=60", "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2"]
+SSH_CONTROL_STR = "-o ControlMaster=auto -o ControlPath=/tmp/deq-ssh-%r@%h:%p -o ControlPersist=60 -o ServerAliveInterval=10 -o ServerAliveCountMax=2"
+
+# Transfer job tracking (in-memory, lost on restart)
+transfer_jobs = {}
+transfer_jobs_lock = threading.Lock()
+
+# === AUTHENTICATION ===
+def is_auth_enabled():
+    """Check if authentication is enabled (password file exists)."""
+    return os.path.exists(PASSWORD_FILE)
+
+def verify_password(password):
+    """Verify password against stored hash."""
+    if not is_auth_enabled():
+        return True
+    try:
+        with open(PASSWORD_FILE, 'r') as f:
+            stored = f.read().strip()
+        salt_hex, key_hex = stored.split(':')
+        salt = bytes.fromhex(salt_hex)
+        key = hashlib.scrypt(password.encode('utf-8'), salt=salt, n=16384, r=8, p=1, dklen=32)
+        return secrets.compare_digest(key.hex(), key_hex)
+    except:
+        return False
+
+def get_session_secret():
+    """Get or create session signing secret."""
+    if os.path.exists(SESSION_SECRET_FILE):
+        with open(SESSION_SECRET_FILE, 'r') as f:
+            return f.read().strip()
+    secret = secrets.token_hex(32)
+    with open(SESSION_SECRET_FILE, 'w') as f:
+        f.write(secret)
+    os.chmod(SESSION_SECRET_FILE, 0o600)
+    return secret
+
+def create_session_token():
+    """Create signed session token."""
+    timestamp = str(int(time.time()))
+    signature = hmac.new(get_session_secret().encode(), timestamp.encode(), 'sha256').hexdigest()
+    return f"{timestamp}:{signature}"
+
+def verify_session_token(token):
+    """Verify session token signature."""
+    if not token:
+        return False
+    try:
+        timestamp, signature = token.split(':')
+        expected = hmac.new(get_session_secret().encode(), timestamp.encode(), 'sha256').hexdigest()
+        return secrets.compare_digest(signature, expected)
+    except:
+        return False
+
+def format_size(bytes_val):
+    """Format bytes as human-readable string."""
+    if bytes_val < 1024:
+        return f"{bytes_val} B"
+    elif bytes_val < 1024 * 1024:
+        return f"{bytes_val / 1024:.1f} KB"
+    elif bytes_val < 1024 * 1024 * 1024:
+        return f"{bytes_val / (1024 * 1024):.1f} MB"
+    elif bytes_val < 1024 * 1024 * 1024 * 1024:
+        return f"{bytes_val / (1024 * 1024 * 1024):.1f} GB"
+    else:
+        return f"{bytes_val / (1024 * 1024 * 1024 * 1024):.1f} TB"
+
+def get_path_size(device, path):
+    """Get size of path in bytes via du -sb. Returns int or None on error."""
+    try:
+        safe_path = shlex.quote(path)
+        if device.get('is_host', False):
+            result = subprocess.run(f"du -sb {safe_path} 2>/dev/null | cut -f1",
+                                    shell=True, capture_output=True, text=True, timeout=60)
+        else:
+            ssh_config = device.get('ssh', {})
+            user = ssh_config.get('user')
+            port = ssh_config.get('port', 22)
+            ip = device.get('ip')
+            if not user:
+                return None
+            result = subprocess.run(
+                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                 "-p", str(port), f"{user}@{ip}", f"du -sb {safe_path} 2>/dev/null | cut -f1"],
+                capture_output=True, text=True, timeout=60
+            )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(result.stdout.strip())
+        return None
+    except:
+        return None
+
+def get_free_space(device, path):
+    """Get free space at path in bytes. Returns int or None on error."""
+    try:
+        safe_path = shlex.quote(path)
+        if device.get('is_host', False):
+            return shutil.disk_usage(path).free
+        else:
+            ssh_config = device.get('ssh', {})
+            user = ssh_config.get('user')
+            port = ssh_config.get('port', 22)
+            ip = device.get('ip')
+            if not user:
+                return None
+            result = subprocess.run(
+                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                 "-p", str(port), f"{user}@{ip}", f"df -B1 {safe_path} 2>/dev/null | tail -1 | awk '{{print $4}}'"],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return int(result.stdout.strip())
+            return None
+    except:
+        return None
+
+def run_rsync_with_progress(cmd, progress_callback, idle_timeout=60):
+    """Run rsync and call progress_callback(percent, speed, eta) on updates.
+    Returns (success: bool, error: str or None). Timeout only on idle (no progress)."""
+    try:
+        import fcntl
+        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+        # Set non-blocking
+        fd = process.stdout.fileno()
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        last_progress_time = time.time()
+        buffer = ""
+        last_error = ""
+
+        while True:
+            try:
+                chunk = process.stdout.read(4096)
+                if chunk:
+                    buffer += chunk.decode('utf-8', errors='replace')
+                    last_progress_time = time.time()
+            except (BlockingIOError, IOError):
+                pass
+
+            # Process complete lines
+            while '\r' in buffer or '\n' in buffer:
+                r_pos = buffer.find('\r')
+                n_pos = buffer.find('\n')
+                if r_pos == -1: r_pos = len(buffer)
+                if n_pos == -1: n_pos = len(buffer)
+                pos = min(r_pos, n_pos)
+
+                line = buffer[:pos]
+                buffer = buffer[pos+1:]
+
+                if not line.strip():
+                    continue
+
+                match = re.search(r'(\d+)%\s+([\d.,]+\s*\w+/s)\s+(\d+:\d+(?::\d+)?)', line)
+                if match:
+                    percent = int(match.group(1))
+                    speed = match.group(2)
+                    eta = match.group(3)
+                    progress_callback(percent, speed, eta)
+                elif 'error' in line.lower() or 'failed' in line.lower():
+                    last_error = line.strip()
+
+            if process.poll() is not None:
+                break
+
+            if time.time() - last_progress_time > idle_timeout:
+                process.kill()
+                return False, "Transfer stalled (no output for 60 seconds)"
+
+            time.sleep(0.1)
+
+        process.wait()
+        return process.returncode == 0, last_error if process.returncode != 0 else None
+    except Exception as e:
+        return False, str(e)
+
+def start_transfer_job(device, paths, dest_device, dest_path, operation, cleanup_path=None):
+    """Start a transfer job in background thread. Returns job_id."""
+    job_id = f"transfer_{int(time.time())}_{random.randint(1000, 9999)}"
+
+    is_host = device.get('is_host', False)
+    dest_is_host = dest_device.get('is_host', False)
+    phases = 2 if (not is_host and not dest_is_host) else 1
+
+    with transfer_jobs_lock:
+        transfer_jobs[job_id] = {
+            "status": "running",
+            "progress": 0,
+            "phase": 1,
+            "phases": phases,
+            "speed": None,
+            "eta": None,
+            "error": None,
+            "started_at": time.time()
+        }
+
+    thread = threading.Thread(
+        target=run_transfer_job,
+        args=(job_id, device, paths, dest_device, dest_path, operation, cleanup_path)
+    )
+    thread.daemon = True
+    thread.start()
+
+    return job_id
+
+def update_job_progress(job_id, progress, speed=None, eta=None, phase=None):
+    """Update job progress."""
+    with transfer_jobs_lock:
+        if job_id in transfer_jobs:
+            transfer_jobs[job_id]["progress"] = progress
+            if speed:
+                transfer_jobs[job_id]["speed"] = speed
+            if eta:
+                transfer_jobs[job_id]["eta"] = eta
+            if phase:
+                transfer_jobs[job_id]["phase"] = phase
+
+def complete_job(job_id, error=None):
+    """Mark job as complete or failed."""
+    with transfer_jobs_lock:
+        if job_id in transfer_jobs:
+            transfer_jobs[job_id]["status"] = "error" if error else "complete"
+            transfer_jobs[job_id]["error"] = error
+            transfer_jobs[job_id]["completed_at"] = time.time()
+
+def get_job_status(job_id):
+    """Get current job status."""
+    cleanup_old_jobs()
+    with transfer_jobs_lock:
+        job = transfer_jobs.get(job_id)
+        if not job:
+            return {"status": "not_found"}
+        return job.copy()
+
+def cleanup_old_jobs(max_age=300):
+    """Remove completed jobs older than max_age seconds."""
+    now = time.time()
+    with transfer_jobs_lock:
+        to_remove = [
+            jid for jid, job in transfer_jobs.items()
+            if job["status"] in ("complete", "error")
+            and job.get("completed_at", 0) + max_age < now
+        ]
+        for jid in to_remove:
+            del transfer_jobs[jid]
+
+def run_transfer_job(job_id, device, paths, dest_device, dest_path, operation, cleanup_path=None):
+    """Execute transfer in background thread."""
+    try:
+        ssh_config = device.get('ssh', {})
+        user = ssh_config.get('user')
+        port = ssh_config.get('port', 22)
+        ip = device.get('ip')
+        is_host = device.get('is_host', False)
+
+        dest_ssh = dest_device.get('ssh', {})
+        dest_user = dest_ssh.get('user')
+        dest_port = dest_ssh.get('port', 22)
+        dest_ip = dest_device.get('ip')
+        dest_is_host = dest_device.get('is_host', False)
+
+        for src_path in paths:
+            safe_src = shlex.quote(src_path)
+            safe_dest = shlex.quote(dest_path)
+
+            def progress_callback(percent, speed, eta):
+                update_job_progress(job_id, percent, speed, eta)
+
+            if is_host and dest_is_host:
+                cmd = f"rsync -a --progress {safe_src} {safe_dest}/"
+                success, err = run_rsync_with_progress(cmd, progress_callback)
+
+            elif is_host and not dest_is_host:
+                cmd = f"rsync -a --progress -e 'ssh {SSH_CONTROL_STR} -o StrictHostKeyChecking=no -p {dest_port}' {safe_src} {dest_user}@{dest_ip}:{safe_dest}/"
+                success, err = run_rsync_with_progress(cmd, progress_callback)
+
+            elif not is_host and dest_is_host:
+                cmd = f"rsync -a --progress -e 'ssh {SSH_CONTROL_STR} -o StrictHostKeyChecking=no -p {port}' {user}@{ip}:{safe_src} {safe_dest}/"
+                success, err = run_rsync_with_progress(cmd, progress_callback)
+
+            elif device.get('id') == dest_device.get('id'):
+                # Same remote device - run rsync directly on remote
+                ssh_cmd = ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-p", str(port), f"{user}@{ip}",
+                           f"rsync -a {safe_src} {safe_dest}/"]
+                result = subprocess.run(ssh_cmd, capture_output=True, text=True)
+                success = result.returncode == 0
+                err = result.stderr.strip() if not success else None
+
+            else:
+                # Remote to remote (two phases, via host)
+                temp_path = f"/tmp/deq_transfer_{job_id}"
+                safe_temp = shlex.quote(temp_path)
+
+                # Phase 1: Remote to Host
+                update_job_progress(job_id, 0, phase=1)
+                cmd1 = f"rsync -a --progress -e 'ssh {SSH_CONTROL_STR} -o StrictHostKeyChecking=no -p {port}' {user}@{ip}:{safe_src} {safe_temp}/"
+                success, err = run_rsync_with_progress(cmd1, progress_callback)
+
+                if not success:
+                    subprocess.run(f"rm -rf {safe_temp}", shell=True)
+                    complete_job(job_id, f"Download failed: {err}")
+                    return
+
+                # Phase 2: Host to Remote
+                update_job_progress(job_id, 0, phase=2)
+                src_name = src_path.rstrip('/').split('/')[-1]
+                safe_temp_src = shlex.quote(f"{temp_path}/{src_name}")
+                cmd2 = f"rsync -a --progress -e 'ssh {SSH_CONTROL_STR} -o StrictHostKeyChecking=no -p {dest_port}' {safe_temp_src} {dest_user}@{dest_ip}:{safe_dest}/"
+                success, err = run_rsync_with_progress(cmd2, progress_callback)
+
+                subprocess.run(f"rm -rf {safe_temp}", shell=True)
+
+            if not success:
+                complete_job(job_id, f"Failed to {operation} {src_path}: {err}")
+                return
+
+            # For move: delete source after successful copy
+            if operation == 'move':
+                if is_host:
+                    subprocess.run(f"rm -rf {safe_src}", shell=True)
+                else:
+                    subprocess.run(
+                        ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no",
+                         "-p", str(port), f"{user}@{ip}", f"rm -rf {safe_src}"],
+                        capture_output=True
+                    )
+
+        # Cleanup temp directory if specified (used by extract cross-device)
+        if cleanup_path:
+            is_host = device.get('is_host', False)
+            if is_host:
+                subprocess.run(f"rm -rf {shlex.quote(cleanup_path)}", shell=True)
+            else:
+                ssh_config = device.get('ssh', {})
+                subprocess.run(
+                    ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no",
+                     "-p", str(ssh_config.get('port', 22)), f"{ssh_config.get('user')}@{device.get('ip')}",
+                     f"rm -rf {shlex.quote(cleanup_path)}"],
+                    capture_output=True
+                )
+
+        complete_job(job_id)
+
+    except Exception as e:
+        complete_job(job_id, str(e))
 
 # === DEFAULT CONFIG ===
 DEFAULT_ALERTS = {"online": True, "cpu": 90, "ram": 90, "cpu_temp": 80, "disk_usage": 90, "disk_temp": 60, "smart": True}
@@ -43,6 +401,7 @@ DEFAULT_CONFIG = {
         "accent_color": "#2ed573"
     },
     "links": [],
+    "quick_actions": [],
     "devices": [],
     "tasks": []
 }
@@ -52,7 +411,7 @@ TASK_LOGS_DIR = f"{DATA_DIR}/task-logs"
 
 def ensure_dirs():
     os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(HISTORY_DIR, exist_ok=True)
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
     os.makedirs(TASK_LOGS_DIR, exist_ok=True)
 
 def load_config():
@@ -91,7 +450,6 @@ ensure_dirs()
 CONFIG = load_config()
 
 # === DEVICE STATUS CACHE ===
-import threading
 device_status_cache = {}
 cache_lock = threading.Lock()
 refresh_in_progress = set()
@@ -127,42 +485,6 @@ def refresh_device_status_async(device):
             refresh_in_progress.discard(dev_id)
 
     threading.Thread(target=do_refresh, daemon=True).start()
-
-# === HISTORY MANAGEMENT ===
-def get_history_file(device_id):
-    return f"{HISTORY_DIR}/{device_id}.json"
-
-def load_history(device_id):
-    path = get_history_file(device_id)
-    if os.path.exists(path):
-        with open(path, 'r') as f:
-            return json.load(f)
-    return {}
-
-def save_history(device_id, history):
-    # Keep only last 400 days
-    cutoff = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
-    history = {k: v for k, v in history.items() if k >= cutoff}
-    with open(get_history_file(device_id), 'w') as f:
-        json.dump(history, f)
-
-def record_stats(device_id, cpu, temp):
-    history = load_history(device_id)
-    today = datetime.now().strftime("%Y-%m-%d")
-    hour = datetime.now().hour
-
-    if today not in history:
-        history[today] = {"hourly": {}, "totals": {"samples": 0, "cpu_sum": 0, "temp_max": 0}}
-
-    # Record hourly (keep latest per hour)
-    history[today]["hourly"][str(hour)] = {"cpu": cpu, "temp": temp}
-
-    # Update totals
-    history[today]["totals"]["samples"] += 1
-    history[today]["totals"]["cpu_sum"] += cpu
-    history[today]["totals"]["temp_max"] = max(history[today]["totals"].get("temp_max", 0), temp or 0)
-
-    save_history(device_id, history)
 
 # === SYSTEM STATS (LOCAL) ===
 def get_disk_smart_info():
@@ -286,11 +608,40 @@ def get_local_stats():
 
     return stats
 
+# === QUICK ACTIONS (Script Execution) ===
+def discover_scripts():
+    """Find all executable scripts in SCRIPTS_DIR recursively."""
+    scripts = []
+    if not os.path.exists(SCRIPTS_DIR):
+        return scripts
+    for root, dirs, files in os.walk(SCRIPTS_DIR):
+        for f in files:
+            full_path = os.path.join(root, f)
+            if os.access(full_path, os.X_OK):
+                rel_path = os.path.relpath(full_path, SCRIPTS_DIR)
+                scripts.append({"path": rel_path, "name": f})
+    return sorted(scripts, key=lambda x: x["path"])
+
+def execute_quick_action(script_path):
+    """Start a script in the background."""
+    full_path = os.path.join(SCRIPTS_DIR, script_path)
+    if not os.path.realpath(full_path).startswith(os.path.realpath(SCRIPTS_DIR)):
+        return {"success": False, "error": "Invalid script path"}
+    if not os.path.exists(full_path):
+        return {"success": False, "error": "Script not found"}
+    if not os.access(full_path, os.X_OK):
+        return {"success": False, "error": "Script not executable"}
+    try:
+        subprocess.Popen([full_path], cwd=SCRIPTS_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 # === REMOTE STATS (SSH) ===
 def get_remote_stats(ip, user, port=22):
     """Get stats from remote device via SSH."""
     stats = {"cpu": 0, "ram_used": 0, "ram_total": 0, "temp": None, "disks": [], "uptime": "", "disk_smart": {}, "container_stats": {}}
-    ssh_base = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", "-p", str(port), f"{user}@{ip}"]
+    ssh_base = ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", "-p", str(port), f"{user}@{ip}"]
 
     # Basic stats (required)
     try:
@@ -429,7 +780,7 @@ def browse_folder(device, path="/"):
             # Use find to list only directories, exclude hidden
             cmd = f"find '{path}' -maxdepth 1 -mindepth 1 -type d ! -name '.*' -printf '%f\\n' 2>/dev/null | sort -f"
             result = subprocess.run(
-                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
                  "-p", str(port), f"{user}@{ip}", cmd],
                 capture_output=True, text=True, timeout=15
             )
@@ -438,7 +789,7 @@ def browse_folder(device, path="/"):
                 # Check if path exists
                 check_cmd = f"test -d '{path}' && echo 'exists' || echo 'notfound'"
                 check_result = subprocess.run(
-                    ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                    ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
                      "-p", str(port), f"{user}@{ip}", check_cmd],
                     capture_output=True, text=True, timeout=10
                 )
@@ -500,7 +851,7 @@ def list_files(device, path="/"):
             # Format: drwxr-xr-x 2 user group 4096 Dec  3 10:30 filename
             cmd = f"ls -la '{path}' 2>/dev/null"
             result = subprocess.run(
-                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
                  "-p", str(port), f"{user}@{ip}", cmd],
                 capture_output=True, text=True, timeout=30
             )
@@ -528,7 +879,6 @@ def list_files(device, path="/"):
 
                 # Convert to timestamp (approximate)
                 try:
-                    import calendar
                     months = {'Jan':1,'Feb':2,'Mar':3,'Apr':4,'May':5,'Jun':6,
                               'Jul':7,'Aug':8,'Sep':9,'Oct':10,'Nov':11,'Dec':12}
                     mon = months.get(month, 1)
@@ -577,7 +927,7 @@ def list_files(device, path="/"):
                 if user:
                     cmd = f"df -B1 '{path}' 2>/dev/null | tail -1"
                     result = subprocess.run(
-                        ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                        ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
                          "-p", str(port), f"{user}@{ip}", cmd],
                         capture_output=True, text=True, timeout=10
                     )
@@ -622,7 +972,7 @@ def file_operation(device, operation, paths, dest_device=None, dest_path=None, n
 
         def run_remote(cmd):
             result = subprocess.run(
-                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
                  "-p", str(port), f"{user}@{ip}", cmd],
                 capture_output=True, text=True, timeout=300
             )
@@ -632,8 +982,8 @@ def file_operation(device, operation, paths, dest_device=None, dest_path=None, n
 
         if operation == 'delete':
             for p in paths:
-                safe_path = p.replace("'", "'\\''")
-                success, err = run_cmd(f"rm -rf '{safe_path}'")
+                safe_path = shlex.quote(p)
+                success, err = run_cmd(f"rm -rf {safe_path}")
                 if not success:
                     return {"success": False, "error": f"Failed to delete {p}: {err}"}
             return {"success": True}
@@ -641,10 +991,10 @@ def file_operation(device, operation, paths, dest_device=None, dest_path=None, n
         elif operation == 'rename':
             if len(paths) != 1 or not new_name:
                 return {"success": False, "error": "Rename requires exactly one file and new name"}
-            old_path = paths[0].replace("'", "'\\''")
+            old_path = shlex.quote(paths[0])
             parent = '/'.join(paths[0].rstrip('/').split('/')[:-1]) or '/'
-            new_path = f"{parent}/{new_name}".replace("'", "'\\''")
-            success, err = run_cmd(f"mv '{old_path}' '{new_path}'")
+            new_path = shlex.quote(f"{parent}/{new_name}")
+            success, err = run_cmd(f"mv {old_path} {new_path}")
             if not success:
                 return {"success": False, "error": f"Failed to rename: {err}"}
             return {"success": True}
@@ -655,8 +1005,8 @@ def file_operation(device, operation, paths, dest_device=None, dest_path=None, n
             if '/' in new_name or '\x00' in new_name:
                 return {"success": False, "error": "Invalid folder name"}
             parent = paths[0] if paths else '/'
-            folder_path = f"{parent.rstrip('/')}/{new_name}".replace("'", "'\\''")
-            success, err = run_cmd(f"mkdir '{folder_path}'")
+            folder_path = shlex.quote(f"{parent.rstrip('/')}/{new_name}")
+            success, err = run_cmd(f"mkdir {folder_path}")
             if not success:
                 return {"success": False, "error": f"Failed to create folder: {err}"}
             return {"success": True}
@@ -677,7 +1027,7 @@ def file_operation(device, operation, paths, dest_device=None, dest_path=None, n
                 use_zip = 'zip' in result.stdout
             else:
                 result = subprocess.run(
-                    ["ssh", "-o", "StrictHostKeyChecking=no", "-p", str(port), f"{user}@{ip}", check_zip],
+                    ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-p", str(port), f"{user}@{ip}", check_zip],
                     capture_output=True, text=True, timeout=10
                 )
                 use_zip = 'zip' in result.stdout
@@ -690,73 +1040,135 @@ def file_operation(device, operation, paths, dest_device=None, dest_path=None, n
             archive_path = f"{parent}/{archive_name}"
 
             # Build file list for command
-            file_args = ' '.join([f"'{p.replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'" for p in paths])
+            rel_names = ' '.join([shlex.quote(p.split('/')[-1]) for p in paths])
+            safe_parent = shlex.quote(parent)
+            safe_archive = shlex.quote(archive_name)
 
             if use_zip:
-                # For zip, we need to be in parent dir and use relative paths
-                rel_names = ' '.join([f"'{p.split('/')[-1]}'" for p in paths])
-                cmd = f"cd '{parent}' && zip -r '{archive_name}' {rel_names}"
+                cmd = f"cd {safe_parent} && zip -r {safe_archive} {rel_names}"
             else:
-                rel_names = ' '.join([f"'{p.split('/')[-1]}'" for p in paths])
-                cmd = f"cd '{parent}' && tar -czf '{archive_name}' {rel_names}"
+                cmd = f"cd {safe_parent} && tar -czf {safe_archive} {rel_names}"
 
             success, err = run_cmd(cmd)
             if not success:
                 return {"success": False, "error": f"Failed to create archive: {err}"}
             return {"success": True, "archive": archive_path}
 
+        elif operation == 'extract':
+            if len(paths) != 1:
+                return {"success": False, "error": "Select exactly one archive"}
+            if not dest_path:
+                return {"success": False, "error": "Destination path required"}
+
+            archive = paths[0]
+            name = archive.split('/')[-1].lower()
+            safe_archive = shlex.quote(archive)
+
+            # Determine extract command based on format
+            if name.endswith('.zip'):
+                extract_cmd = lambda dest: f"unzip -o {safe_archive} -d {shlex.quote(dest)}"
+            elif name.endswith(('.tar.gz', '.tgz')):
+                extract_cmd = lambda dest: f"tar -xzf {safe_archive} -C {shlex.quote(dest)}"
+            elif name.endswith(('.tar.bz2', '.tbz2')):
+                extract_cmd = lambda dest: f"tar -xjf {safe_archive} -C {shlex.quote(dest)}"
+            elif name.endswith(('.tar.xz', '.txz')):
+                extract_cmd = lambda dest: f"tar -xJf {safe_archive} -C {shlex.quote(dest)}"
+            elif name.endswith('.tar'):
+                extract_cmd = lambda dest: f"tar -xf {safe_archive} -C {shlex.quote(dest)}"
+            else:
+                return {"success": False, "error": "Unsupported archive format"}
+
+            # Same device: extract directly to dest_path
+            if not dest_device or dest_device.get('id') == device.get('id'):
+                success, err = run_cmd(extract_cmd(dest_path))
+                if not success:
+                    if 'unzip' in err.lower() or 'not found' in err.lower():
+                        return {"success": False, "error": "unzip not installed"}
+                    return {"success": False, "error": f"Extract failed: {err}"}
+                return {"success": True}
+
+            # Cross device: extract to temp, then transfer
+            temp_dir = f"/tmp/deq_extract_{int(time.time())}"
+            run_cmd(f"mkdir -p {shlex.quote(temp_dir)}")
+            success, err = run_cmd(extract_cmd(temp_dir))
+            if not success:
+                run_cmd(f"rm -rf {shlex.quote(temp_dir)}")
+                if 'unzip' in err.lower() or 'not found' in err.lower():
+                    return {"success": False, "error": "unzip not installed"}
+                return {"success": False, "error": f"Extract failed: {err}"}
+
+            # Get list of extracted items
+            if is_host:
+                items = [f"{temp_dir}/{f}" for f in os.listdir(temp_dir)]
+            else:
+                result = subprocess.run(
+                    ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-p", str(port), f"{user}@{ip}",
+                     f"ls -1 {shlex.quote(temp_dir)}"],
+                    capture_output=True, text=True, timeout=30
+                )
+                items = [f"{temp_dir}/{f}" for f in result.stdout.strip().split('\n') if f]
+
+            if not items:
+                run_cmd(f"rm -rf {shlex.quote(temp_dir)}")
+                return {"success": False, "error": "Archive was empty"}
+
+            # Start transfer job (will clean up temp_dir when done)
+            job_id = start_transfer_job(device, items, dest_device, dest_path, 'copy', cleanup_path=temp_dir)
+            return {"success": True, "job_id": job_id, "transfer": True}
+
+        elif operation == 'preflight':
+            if not paths:
+                return {"ok": False, "error": "No paths specified"}
+            if not dest_device or not dest_path:
+                return {"ok": False, "error": "Destination required"}
+
+            dest_is_host = dest_device.get('is_host', False)
+
+            # Get total source size (all selected items)
+            src_size = 0
+            for p in paths:
+                size = get_path_size(device, p)
+                if size is None:
+                    return {"ok": False, "error": f"Cannot determine size of {p}"}
+                src_size += size
+
+            # Check destination space
+            dest_free = get_free_space(dest_device, dest_path)
+            if dest_free is None:
+                return {"ok": False, "error": "Cannot check destination space"}
+
+            if src_size > dest_free:
+                return {"ok": False, "error": f"Not enough space on destination (need {format_size(src_size)}, have {format_size(dest_free)})"}
+
+            # Remote-to-Remote: Check host space (but not if same device)
+            same_device = device.get('id') == dest_device.get('id')
+            needs_host = not is_host and not dest_is_host and not same_device
+            host_free = None
+
+            if needs_host:
+                host_free = shutil.disk_usage("/tmp").free
+                if src_size > host_free:
+                    return {"ok": False, "error": f"Not enough space on host for transfer (need {format_size(src_size)}, have {format_size(host_free)})"}
+
+            return {
+                "ok": True,
+                "src_size": src_size,
+                "dest_free": dest_free,
+                "host_free": host_free,
+                "needs_host_transfer": needs_host
+            }
+
         elif operation in ('copy', 'move'):
             if not dest_device or not dest_path:
                 return {"success": False, "error": "Destination required"}
 
-            dest_ssh = dest_device.get('ssh', {})
-            dest_user = dest_ssh.get('user')
-            dest_port = dest_ssh.get('port', 22)
-            dest_ip = dest_device.get('ip')
             dest_is_host = dest_device.get('is_host', False)
-
-            if not dest_is_host and not dest_user:
+            if not dest_is_host and not dest_device.get('ssh', {}).get('user'):
                 return {"success": False, "error": "Destination SSH not configured"}
 
-            for src_path in paths:
-                safe_src = src_path.replace("'", "'\\''")
-                safe_dest = dest_path.replace("'", "'\\''")
-
-                # Determine rsync source and destination
-                if is_host and dest_is_host:
-                    # Local to local
-                    rsync_cmd = f"rsync -a '{safe_src}' '{safe_dest}/'"
-                    success, err = run_local(rsync_cmd)
-                elif is_host and not dest_is_host:
-                    # Local to remote
-                    rsync_cmd = f"rsync -a -e 'ssh -o StrictHostKeyChecking=no -p {dest_port}' '{safe_src}' {dest_user}@{dest_ip}:'{safe_dest}/'"
-                    success, err = run_local(rsync_cmd)
-                elif not is_host and dest_is_host:
-                    # Remote to local
-                    rsync_cmd = f"rsync -a -e 'ssh -o StrictHostKeyChecking=no -p {port}' {user}@{ip}:'{safe_src}' '{safe_dest}/'"
-                    success, err = run_local(rsync_cmd)
-                else:
-                    # Remote to remote - copy through host
-                    # First copy to temp, then to dest
-                    temp_path = f"/tmp/deq_transfer_{int(time.time())}"
-                    rsync_cmd1 = f"rsync -a -e 'ssh -o StrictHostKeyChecking=no -p {port}' {user}@{ip}:'{safe_src}' '{temp_path}/'"
-                    success, err = run_local(rsync_cmd1)
-                    if success:
-                        src_name = src_path.rstrip('/').split('/')[-1]
-                        rsync_cmd2 = f"rsync -a -e 'ssh -o StrictHostKeyChecking=no -p {dest_port}' '{temp_path}/{src_name}' {dest_user}@{dest_ip}:'{safe_dest}/'"
-                        success, err = run_local(rsync_cmd2)
-                        run_local(f"rm -rf '{temp_path}'")
-
-                if not success:
-                    return {"success": False, "error": f"Failed to {operation} {src_path}: {err}"}
-
-                # For move, delete source after successful copy
-                if operation == 'move':
-                    del_success, del_err = run_cmd(f"rm -rf '{safe_src}'")
-                    if not del_success:
-                        return {"success": False, "error": f"Copied but failed to delete source: {del_err}"}
-
-            return {"success": True}
+            # Start async transfer job
+            job_id = start_transfer_job(device, paths, dest_device, dest_path, operation)
+            return {"success": True, "job_id": job_id}
 
         else:
             return {"success": False, "error": f"Unknown operation: {operation}"}
@@ -788,7 +1200,7 @@ def get_file_for_download(device, file_path):
 
             # Use cat to get file content
             result = subprocess.run(
-                ["ssh", "-o", "StrictHostKeyChecking=no", "-p", str(port),
+                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-p", str(port),
                  f"{user}@{ip}", f"cat '{file_path}'"],
                 capture_output=True, timeout=60
             )
@@ -888,7 +1300,8 @@ def get_health_status():
             "id": dev_id,
             "name": dev.get('name', 'Unknown'),
             "online": online,
-            "alerts": alerts
+            "alerts": alerts,
+            "is_host": dev.get('is_host', False)
         }
 
         if stats:
@@ -922,12 +1335,25 @@ def get_health_status():
 
         devices.append(device_info)
 
+    # Task statuses - include all tasks with enabled status
+    tasks = []
+    for task in CONFIG.get('tasks', []):
+        tasks.append({
+            "id": task.get('id'),
+            "name": task.get('name', 'Unknown'),
+            "status": task.get('last_status'),
+            "error": task.get('last_error'),
+            "last_run": task.get('last_run'),
+            "enabled": task.get('enabled', True)
+        })
+
     return {
         "devices": devices,
         "containers": {
             "running": containers_running,
             "stopped": containers_stopped
         },
+        "tasks": tasks,
         "timestamp": int(time.time())
     }
 
@@ -967,7 +1393,7 @@ def remote_docker_action(ip, user, port, container, action, use_sudo=False):
 
     try:
         result = subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+            ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
              "-p", str(port), f"{user}@{ip}", f'bash -lc "{ssh_cmd}"'],
             capture_output=True, text=True, timeout=60
         )
@@ -1023,7 +1449,7 @@ def scan_docker_containers(device):
             docker_cmd = "sudo docker" if use_sudo else "docker"
             ssh_cmd = f'{docker_cmd} ps -a --format "{{{{.Names}}}}"'
             result = subprocess.run(
-                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
                  "-p", str(port), f"{user}@{ip}", f'bash -lc "{ssh_cmd}"'],
                 capture_output=True, text=True, timeout=15
             )
@@ -1208,7 +1634,7 @@ def get_all_container_statuses(device):
 
         try:
             result = subprocess.run(
-                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
                  "-p", str(port), f"{user}@{ip}",
                  "docker ps -a --format '{{.Names}}:{{.State}}'"],
                 capture_output=True, text=True, timeout=15
@@ -1256,8 +1682,8 @@ def docker_action(container, action):
 def ssh_shutdown(ip, user, port=22):
     try:
         result = subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
-             "-p", str(port), f"{user}@{ip}", "sudo", "shutdown", "-h", "now"],
+            ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+             "-p", str(port), f"{user}@{ip}", "sudo", "systemctl", "poweroff"],
             capture_output=True, text=True, timeout=30
         )
         return {"success": True}
@@ -1266,9 +1692,1118 @@ def ssh_shutdown(ip, user, port=22):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+def ssh_suspend(ip, user, port=22):
+    try:
+        result = subprocess.run(
+            ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5",
+             "-p", str(port), f"{user}@{ip}", "sudo", "systemctl", "suspend"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return {"success": False, "error": result.stderr.strip() or "Suspend failed"}
+        return {"success": True}
+    except subprocess.TimeoutExpired:
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# === TASK EXECUTION ===
+def log_task(task_id, message, max_lines=500):
+    """Append a log line to the task's log file, keeping only last max_lines."""
+    log_file = f"{TASK_LOGS_DIR}/{task_id}.log"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}\n"
+
+    lines = []
+    if os.path.exists(log_file):
+        with open(log_file, 'r') as f:
+            lines = f.readlines()
+    lines.append(line)
+
+    with open(log_file, 'w') as f:
+        f.writelines(lines[-max_lines:])
+
+# Track running tasks
+running_tasks = {}
+
+def run_task_async(task_id):
+    """Execute a task in a background thread."""
+    global CONFIG, running_tasks
+
+    task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
+    if not task:
+        return
+
+    task_type = task.get('type', 'backup')
+    log_task(task_id, f"Starting {task_type} task: {task.get('name', 'unnamed')}")
+
+    try:
+        if task_type == 'backup':
+            result = run_backup_task(task)
+        elif task_type == 'wake':
+            result = run_wake_task(task)
+        elif task_type == 'shutdown':
+            result = run_shutdown_task(task)
+        elif task_type == 'suspend':
+            result = run_suspend_task(task)
+        elif task_type == 'script':
+            result = run_script_task(task)
+        else:
+            result = {"success": False, "error": f"Unknown task type: {task_type}"}
+
+        # Update task status
+        task['last_run'] = datetime.now().isoformat()
+        if result.get('success'):
+            task['last_status'] = 'success'
+            task['last_error'] = None
+            if 'size' in result:
+                task['last_size'] = result['size']
+            log_task(task_id, f"Completed successfully")
+        elif result.get('skipped'):
+            task['last_status'] = 'skipped'
+            task['last_error'] = result.get('error', 'source offline')
+            log_task(task_id, f"Skipped: {task['last_error']}")
+        else:
+            task['last_status'] = 'failed'
+            task['last_error'] = result.get('error', 'unknown error')
+            log_task(task_id, f"Failed: {task['last_error']}")
+
+        save_config(CONFIG)
+
+    except Exception as e:
+        task['last_run'] = datetime.now().isoformat()
+        task['last_status'] = 'failed'
+        task['last_error'] = str(e)
+        save_config(CONFIG)
+        log_task(task_id, f"Exception: {e}")
+
+    finally:
+        running_tasks.pop(task_id, None)
+
+
+def run_task(task_id):
+    """Start a task in background thread, return immediately."""
+    global CONFIG, running_tasks
+
+    task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
+    if not task:
+        return {"success": False, "error": "Task not found"}
+
+    if task_id in running_tasks:
+        return {"success": False, "error": "Task already running"}
+
+    # Start in background thread
+    running_tasks[task_id] = True
+    thread = threading.Thread(target=run_task_async, args=(task_id,), daemon=True)
+    thread.start()
+
+    return {"success": True, "started": True}
+
+def run_backup_task(task):
+    """Execute a backup task using rsync."""
+    source = task.get('source', {})
+    dest = task.get('dest', {})
+    options = task.get('options', {})
+
+    source_device = next((d for d in CONFIG['devices'] if d['id'] == source.get('device')), None)
+    dest_device = next((d for d in CONFIG['devices'] if d['id'] == dest.get('device')), None)
+
+    if not source_device or not dest_device:
+        return {"success": False, "error": "Source or destination device not found"}
+
+    source_path = source.get('path', '')
+    dest_path = dest.get('path', '')
+
+    if not source_path or not dest_path:
+        return {"success": False, "error": "Source or destination path not specified"}
+
+    # Check if source device is online
+    source_is_host = source_device.get('is_host', False)
+    if not source_is_host:
+        if not ping_host(source_device['ip']):
+            return {"success": False, "skipped": True, "error": "source offline"}
+
+    # Build rsync command
+    rsync_opts = ["-avz", "--stats"]
+    if options.get('delete'):
+        rsync_opts.append("--delete")
+
+    # Source path - respect user's trailing slash choice
+    if source_is_host:
+        rsync_source = source_path
+    else:
+        ssh_user = source_device.get('ssh', {}).get('user', 'root')
+        ssh_port = source_device.get('ssh', {}).get('port', 22)
+        rsync_opts.extend(["-e", f"ssh {SSH_CONTROL_STR} -p {ssh_port} -o StrictHostKeyChecking=no -o ConnectTimeout=10"])
+        rsync_source = f"{ssh_user}@{source_device['ip']}:{source_path}"
+
+    # Destination path - respect user's trailing slash choice
+    dest_is_host = dest_device.get('is_host', False)
+    if dest_is_host:
+        # Ensure destination directory exists
+        os.makedirs(dest_path, exist_ok=True)
+        rsync_dest = dest_path
+    else:
+        ssh_user = dest_device.get('ssh', {}).get('user', 'root')
+        ssh_port = dest_device.get('ssh', {}).get('port', 22)
+        if "-e" not in rsync_opts:
+            rsync_opts.extend(["-e", f"ssh {SSH_CONTROL_STR} -p {ssh_port} -o StrictHostKeyChecking=no -o ConnectTimeout=10"])
+        rsync_dest = f"{ssh_user}@{dest_device['ip']}:{dest_path}"
+
+    cmd = ["rsync"] + rsync_opts + [rsync_source, rsync_dest]
+    log_task(task['id'], f"Running: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+
+        if result.returncode == 0:
+            # Parse total size from rsync stats
+            size = ""
+            for line in result.stdout.split('\n'):
+                if 'Total file size' in line and 'transferred' not in line:
+                    parts = line.split(':')
+                    if len(parts) > 1:
+                        size = parts[1].strip().split()[0]
+                        # Convert to human readable
+                        try:
+                            # Remove thousand separators (comma or dot)
+                            bytes_val = int(size.replace(',', '').replace('.', ''))
+                            if bytes_val >= 1e9:
+                                size = f"{bytes_val/1e9:.1f}GB"
+                            elif bytes_val >= 1e6:
+                                size = f"{bytes_val/1e6:.0f}MB"
+                            else:
+                                size = f"{bytes_val/1e3:.0f}KB"
+                        except:
+                            pass
+            return {"success": True, "size": size}
+        else:
+            return {"success": False, "error": result.stderr[:200] if result.stderr else "rsync failed"}
+
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "timeout (1h)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def run_wake_task(task):
+    """Execute a wake task - WOL for device, docker start for container."""
+    target = task.get('target', 'device')
+
+    if target == 'docker':
+        container = task.get('container')
+        if not container:
+            return {"success": False, "error": "No container specified"}
+        return docker_action(container, 'start')
+
+    # Device wake (WOL)
+    device_id = task.get('device') or task.get('source', {}).get('device')  # backward compat
+    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
+
+    if not device:
+        return {"success": False, "error": "Device not found"}
+
+    if not device.get('wol', {}).get('mac'):
+        return {"success": False, "error": "Device has no WOL configured"}
+
+    result = send_wol(device['wol']['mac'], device['wol'].get('broadcast', '255.255.255.255'))
+    return result
+
+
+def run_shutdown_task(task):
+    """Execute a shutdown task - SSH shutdown for device, docker stop for container."""
+    target = task.get('target', 'device')
+
+    if target == 'docker':
+        container = task.get('container')
+        if not container:
+            return {"success": False, "error": "No container specified"}
+        return docker_action(container, 'stop')
+
+    # Device shutdown
+    device_id = task.get('device')
+    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
+
+    if not device:
+        return {"success": False, "error": "Device not found"}
+
+    # Host device: local shutdown
+    if device.get('is_host'):
+        try:
+            subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # Remote device: SSH shutdown
+    if not device.get('ssh', {}).get('user'):
+        return {"success": False, "error": "Device has no SSH configured"}
+
+    result = ssh_shutdown(device['ip'], device['ssh']['user'], device['ssh'].get('port', 22))
+    return result
+
+def run_suspend_task(task):
+    """Execute a suspend task - SSH suspend for device (no docker equivalent)."""
+    device_id = task.get('device')
+    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
+
+    if not device:
+        return {"success": False, "error": "Device not found"}
+
+    # Host device: local suspend
+    if device.get('is_host'):
+        try:
+            subprocess.Popen(["sudo", "systemctl", "suspend"])
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # Remote device: SSH suspend
+    if not device.get('ssh', {}).get('user'):
+        return {"success": False, "error": "Device has no SSH configured"}
+
+    result = ssh_suspend(device['ip'], device['ssh']['user'], device['ssh'].get('port', 22))
+    return result
+
+def run_script_task(task):
+    """Start a scheduled script."""
+    script_path = task.get('script')
+    if not script_path:
+        return {"success": False, "error": "No script specified"}
+    return execute_quick_action(script_path)
+
+
+# === TASK SCHEDULER ===
+def calculate_next_run(task):
+    """Calculate the next run time for a task based on its schedule."""
+    if not task.get('enabled', True):
+        return None
+
+    schedule = task.get('schedule', {})
+    schedule_type = schedule.get('type', 'daily')
+    time_str = schedule.get('time', '03:00')
+
+    try:
+        hour, minute = map(int, time_str.split(':'))
+    except Exception:
+        hour, minute = 3, 0
+
+    now = datetime.now()
+
+    if schedule_type == 'hourly':
+        # Run every hour at specified minute
+        next_run = now.replace(minute=minute, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(hours=1)
+
+    elif schedule_type == 'daily':
+        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+
+    elif schedule_type == 'weekly':
+        day = schedule.get('day', 0)  # 0 = Sunday
+        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        # Convert to Python weekday (0=Monday)
+        py_day = (day - 1) % 7 if day > 0 else 6
+        days_ahead = py_day - now.weekday()
+        if days_ahead < 0 or (days_ahead == 0 and next_run <= now):
+            days_ahead += 7
+        next_run += timedelta(days=days_ahead)
+
+    elif schedule_type == 'monthly':
+        date = schedule.get('date', 1)
+        # Try current month first
+        year, month = now.year, now.month
+        for _ in range(12):  # Try up to 12 months ahead
+            try:
+                next_run = datetime(year, month, date, hour, minute, 0)
+                if next_run > now:
+                    break
+                # Move to next month
+                month += 1
+                if month > 12:
+                    month = 1
+                    year += 1
+            except ValueError:
+                # Invalid day for this month (e.g., Feb 30), try next month
+                month += 1
+                if month > 12:
+                    month = 1
+                    year += 1
+        else:
+            return None  # Could not find valid date
+    else:
+        return None
+
+    return next_run.isoformat()
+
+
+class TaskScheduler:
+    """Background scheduler for automated task execution."""
+
+    def __init__(self):
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        """Start the scheduler thread."""
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        print("Task scheduler started")
+
+    def stop(self):
+        """Stop the scheduler thread."""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=5)
+        print("Task scheduler stopped")
+
+    def _run(self):
+        """Main scheduler loop - checks every 60 seconds for due tasks."""
+        # Update next_run times on startup
+        self._update_next_runs()
+
+        while self.running:
+            try:
+                self._check_and_run_tasks()
+            except Exception as e:
+                print(f"Scheduler error: {e}")
+
+            # Sleep for 60 seconds, but check running flag periodically
+            for _ in range(60):
+                if not self.running:
+                    break
+                time.sleep(1)
+
+    def _update_next_runs(self):
+        """Update next_run times for all tasks, preserving valid future times."""
+        global CONFIG
+        changed = False
+        now = datetime.now()
+        for task in CONFIG.get('tasks', []):
+            if task.get('enabled', True):
+                current_next = task.get('next_run')
+                if current_next:
+                    try:
+                        next_dt = datetime.fromisoformat(current_next)
+                        if next_dt > now:
+                            continue
+                    except:
+                        pass
+                next_run = calculate_next_run(task)
+                if next_run != current_next:
+                    task['next_run'] = next_run
+                    changed = True
+        if changed:
+            save_config(CONFIG)
+
+    def _check_and_run_tasks(self):
+        """Check for tasks due to run and execute them."""
+        global CONFIG
+        now = datetime.now()
+
+        for task in CONFIG.get('tasks', []):
+            if not task.get('enabled', True):
+                continue
+
+            next_run_str = task.get('next_run')
+            if not next_run_str:
+                # Calculate and set next_run if missing
+                task['next_run'] = calculate_next_run(task)
+                save_config(CONFIG)
+                continue
+
+            try:
+                next_run = datetime.fromisoformat(next_run_str)
+            except:
+                continue
+
+            if now >= next_run:
+                print(f"Running scheduled task: {task.get('name', task['id'])}")
+                run_task(task['id'])
+
+                # Calculate next run time
+                task['next_run'] = calculate_next_run(task)
+                save_config(CONFIG)
+
+
+# Global scheduler instance
+task_scheduler = TaskScheduler()
+
+
+class RequestHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        print(f"[{self.log_date_time_string()}] {args[0]}")
+    
+    def send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+    
+    def send_html(self, html):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(html.encode())
+    
+    def send_file(self, content, content_type, cache=True):
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        if cache:
+            self.send_header('Cache-Control', 'public, max-age=31536000')
+        self.end_headers()
+        if isinstance(content, str):
+            self.wfile.write(content.encode())
+        else:
+            self.wfile.write(content)
+
+    def get_session_cookie(self):
+        """Get session token from cookie."""
+        cookie_header = self.headers.get('Cookie', '')
+        cookie = SimpleCookie()
+        cookie.load(cookie_header)
+        if SESSION_COOKIE_NAME in cookie:
+            return cookie[SESSION_COOKIE_NAME].value
+        return None
+
+    def is_authenticated(self):
+        """Check if request is authenticated."""
+        if not is_auth_enabled():
+            return True
+        token = self.get_session_cookie()
+        return verify_session_token(token)
+
+    def send_login_page(self):
+        """Send login page HTML."""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(get_login_page().encode())
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        query = parse_qs(urlparse(self.path).query)
+
+        # Static files don't require auth
+        if path in ['/manifest.json', '/icon.svg'] or path.startswith('/fonts/'):
+            pass  # Continue to serve static files
+        elif not self.is_authenticated():
+            self.send_login_page()
+            return
+
+        if path == '/' or path == '':
+            needs_onboarding = not CONFIG.get('onboarding_done') and len(CONFIG.get('devices', [])) <= 1
+            html = get_html_page().replace('__NEEDS_ONBOARDING__', 'true' if needs_onboarding else 'false')
+            self.send_html(html)
+            return
+        
+        if path == '/manifest.json':
+            self.send_file(get_manifest_json(), 'application/manifest+json')
+            return
+        
+        if path == '/icon.svg':
+            self.send_file(get_icon_svg(), 'image/svg+xml')
+            return
+
+        if path.startswith('/fonts/'):
+            font_name = path.split('/')[-1]
+            # Try local fonts dir first (bundled), then DATA_DIR
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            font_paths = [
+                os.path.join(script_dir, 'fonts', font_name),
+                f"{DATA_DIR}/fonts/{font_name}"
+            ]
+            for font_path in font_paths:
+                if os.path.exists(font_path):
+                    with open(font_path, 'rb') as f:
+                        self.send_file(f.read(), 'font/woff2')
+                    return
+            self.send_response(404)
+            self.end_headers()
+            return
+        
+        # API
+        if path.startswith('/api/'):
+            api_path = path[5:].split('?')[0]
+            
+            if api_path == 'config':
+                self.send_json({"success": True, "config": get_config_with_defaults(), "running_tasks": list(running_tasks.keys()), "auth_enabled": is_auth_enabled()})
+                return
+            
+            if api_path == 'stats/host':
+                self.send_json({"success": True, "stats": get_local_stats()})
+                return
+
+            if api_path == 'health':
+                health = get_health_status()
+                self.send_json(health)
+                return
+
+            if api_path == 'version':
+                self.send_json({"version": VERSION, "name": "DeQ"})
+                return
+
+            if api_path == 'network/scan':
+                result = scan_network()
+                self.send_json(result)
+                return
+
+            if api_path == 'scripts/scan':
+                scripts = discover_scripts()
+                self.send_json({"success": True, "scripts": scripts})
+                return
+
+            if api_path.startswith('job/'):
+                job_id = api_path.split('/')[1]
+                status = get_job_status(job_id)
+                self.send_json(status)
+                return
+
+            if api_path.startswith('quick-action/') and api_path.endswith('/run'):
+                parts = api_path.split('/')
+                qa_id = parts[1]
+                qa = next((q for q in CONFIG.get('quick_actions', []) if q['id'] == qa_id), None)
+                if not qa:
+                    self.send_json({"success": False, "error": "Quick action not found"}, 404)
+                    return
+                result = execute_quick_action(qa['path'])
+                self.send_json(result)
+                return
+
+            if api_path.startswith('device/'):
+                parts = api_path.split('/')
+                if len(parts) >= 3:
+                    dev_id = parts[1]
+                    action = parts[2]
+                    dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
+                    
+                    if not dev:
+                        self.send_json({"success": False, "error": "Device not found"}, 404)
+                        return
+                    
+                    if action == 'scan-containers':
+                        result = scan_docker_containers(dev)
+                        self.send_json(result)
+                        return
+
+                    if action == 'ssh-check':
+                        ssh_config = dev.get('ssh', {})
+                        if not ssh_config.get('user'):
+                            self.send_json({"success": False, "error": "No SSH user configured"})
+                            return
+                        try:
+                            result = subprocess.run(
+                                ["ssh"] + SSH_CONTROL_OPTS + ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                                 "-p", str(ssh_config.get('port', 22)), f"{ssh_config['user']}@{dev['ip']}", "echo ok"],
+                                capture_output=True, text=True, timeout=10
+                            )
+                            if result.returncode == 0 and 'ok' in result.stdout:
+                                self.send_json({"success": True})
+                            else:
+                                self.send_json({"success": False, "error": "SSH auth failed"})
+                        except subprocess.TimeoutExpired:
+                            self.send_json({"success": False, "error": "SSH timeout"})
+                        except Exception as e:
+                            self.send_json({"success": False, "error": str(e)})
+                        return
+
+                    if action == 'status':
+                        cached = get_cached_status(dev_id)
+                        refresh_device_status_async(dev)
+                        if cached:
+                            self.send_json({"success": True, **cached})
+                        else:
+                            self.send_json({"success": True, "online": None, "stats": None, "containers": {}})
+                        return
+
+                    if action == 'stats':
+                        if dev.get('is_host'):
+                            stats = get_local_stats()
+                            online = True
+                        else:
+                            online = ping_host(dev.get('ip', ''))
+                            ssh = dev.get('ssh', {})
+                            if online and ssh.get('user'):
+                                stats = get_remote_stats(dev['ip'], ssh['user'], ssh.get('port', 22))
+                            else:
+                                stats = None
+                        self.send_json({"success": True, "stats": stats or {}, "online": online})
+                        return
+
+                    if action == 'wake':
+                        if dev.get('wol', {}).get('mac'):
+                            result = send_wol(dev['wol']['mac'], dev['wol'].get('broadcast', '255.255.255.255'))
+                            self.send_json(result)
+                        else:
+                            self.send_json({"success": False, "error": "WOL not configured"})
+                        return
+                    
+                    if action == 'shutdown':
+                        # Host device: local shutdown
+                        if dev.get('is_host'):
+                            try:
+                                subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+                                self.send_json({"success": True})
+                            except Exception as e:
+                                self.send_json({"success": False, "error": str(e)})
+                            return
+
+                        if dev.get('ssh', {}).get('user'):
+                            result = ssh_shutdown(dev['ip'], dev['ssh']['user'], dev['ssh'].get('port', 22))
+                            self.send_json(result)
+                        else:
+                            self.send_json({"success": False, "error": "SSH not configured"})
+                        return
+
+                    if action == 'suspend':
+                        # Host device: local suspend
+                        if dev.get('is_host'):
+                            try:
+                                subprocess.Popen(["sudo", "systemctl", "suspend"])
+                                self.send_json({"success": True})
+                            except Exception as e:
+                                self.send_json({"success": False, "error": str(e)})
+                            return
+
+                        if dev.get('ssh', {}).get('user'):
+                            result = ssh_suspend(dev['ip'], dev['ssh']['user'], dev['ssh'].get('port', 22))
+                            self.send_json(result)
+                        else:
+                            self.send_json({"success": False, "error": "SSH not configured"})
+                        return
+                    
+                    # Docker: /api/device/{id}/docker/{container}/{action}
+                    if action == 'docker' and len(parts) >= 5:
+                        container_name = parts[3]
+                        docker_act = parts[4]
+
+                        if not is_valid_container_name(container_name):
+                            self.send_json({"success": False, "error": "Invalid container name"})
+                            return
+
+                        containers = dev.get('docker', {}).get('containers', [])
+                        container_names = [c.get('name') if isinstance(c, dict) else c for c in containers]
+
+                        if container_name not in container_names:
+                            self.send_json({"success": False, "error": f"Container '{container_name}' not configured"})
+                            return
+
+                        if dev.get('is_host'):
+                            result = docker_action(container_name, docker_act)
+                        else:
+                            ssh_config = dev.get('ssh', {})
+                            if ssh_config.get('user'):
+                                result = remote_docker_action(
+                                    dev['ip'],
+                                    ssh_config['user'],
+                                    ssh_config.get('port', 22),
+                                    container_name,
+                                    docker_act
+                                )
+                            else:
+                                result = {"success": False, "error": "SSH not configured"}
+
+                        self.send_json(result)
+                        return
+
+                    # Browse folders: /api/device/{id}/browse?path=/
+                    if action == 'browse':
+                        browse_path = query.get('path', ['/'])[0]
+                        result = browse_folder(dev, browse_path)
+                        self.send_json(result)
+                        return
+
+                    # List files: /api/device/{id}/files?path=/
+                    if action == 'files':
+                        file_path = query.get('path', ['/'])[0]
+                        result = list_files(dev, file_path)
+                        self.send_json(result)
+                        return
+
+                    # Download file: /api/device/{id}/download?path=/file.txt
+                    if action == 'download':
+                        file_path = query.get('path', [''])[0]
+                        if not file_path:
+                            self.send_json({"success": False, "error": "Path required"}, 400)
+                            return
+                        content, filename, error = get_file_for_download(dev, file_path)
+                        if error:
+                            self.send_json({"success": False, "error": error}, 400)
+                            return
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'application/octet-stream')
+                        self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+                        self.send_header('Content-Length', len(content))
+                        self.end_headers()
+                        self.wfile.write(content)
+                        return
+
+            # Task status (check if running)
+            if api_path.startswith('task/') and api_path.endswith('/status'):
+                task_id = api_path.split('/')[1]
+                is_running = task_id in running_tasks
+                task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
+                if task:
+                    self.send_json({
+                        "success": True,
+                        "running": is_running,
+                        "last_status": task.get('last_status'),
+                        "last_error": task.get('last_error'),
+                        "last_size": task.get('last_size')
+                    })
+                else:
+                    self.send_json({"success": False, "error": "Task not found"}, 404)
+                return
+
+            self.send_json({"success": False, "error": "Not found"}, 404)
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+
+        # Auth endpoints (no auth required for login)
+        if path == '/auth/login':
+            length = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(length)) if length > 0 else {}
+            password = data.get('password', '')
+            if verify_password(password):
+                token = create_session_token()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Set-Cookie', f'{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True}).encode())
+            else:
+                self.send_json({"success": False, "error": "Invalid password"}, 401)
+            return
+
+        if path == '/auth/logout':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Set-Cookie', f'{SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0')
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True}).encode())
+            return
+
+        # All other POST requests require auth
+        if not self.is_authenticated():
+            self.send_json({"success": False, "error": "Unauthorized"}, 401)
+            return
+
+        if path == '/api/config':
+            length = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(length))
+            global CONFIG
+            CONFIG = data
+            # Update next_run for all enabled tasks
+            for task in CONFIG.get('tasks', []):
+                if task.get('enabled', True):
+                    task['next_run'] = calculate_next_run(task)
+            save_config(CONFIG)
+            self.send_json({"success": True})
+            return
+
+        if path == '/api/onboarding/complete':
+            CONFIG['onboarding_done'] = True
+            save_config(CONFIG)
+            self.send_json({"success": True})
+            return
+
+        # Task execution
+        if path.startswith('/api/task/') and path.endswith('/run'):
+            task_id = path.split('/')[3]
+            result = run_task(task_id)
+            self.send_json(result)
+            return
+
+        # Task toggle (pause/resume)
+        if path.startswith('/api/task/') and path.endswith('/toggle'):
+            task_id = path.split('/')[3]
+            for task in CONFIG.get('tasks', []):
+                if task['id'] == task_id:
+                    task['enabled'] = not task.get('enabled', True)
+                    if task['enabled']:
+                        task['next_run'] = calculate_next_run(task)
+                    save_config(CONFIG)
+                    self.send_json({"success": True, "enabled": task['enabled']})
+                    return
+            self.send_json({"success": False, "error": "Task not found"}, 404)
+            return
+
+        # File operations: /api/device/{id}/files
+        if path.startswith('/api/device/') and path.endswith('/files'):
+            parts = path.split('/')
+            dev_id = parts[3]
+            dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
+
+            if not dev:
+                self.send_json({"success": False, "error": "Device not found"}, 404)
+                return
+
+            length = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(length))
+            operation = data.get('operation')
+            paths = data.get('paths', [])
+
+            if operation in ('copy', 'move', 'preflight'):
+                dest_dev_id = data.get('dest_device')
+                dest_path = data.get('dest_path')
+                dest_dev = next((d for d in CONFIG['devices'] if d['id'] == dest_dev_id), None)
+                if not dest_dev:
+                    self.send_json({"success": False, "error": "Destination device not found"}, 404)
+                    return
+                result = file_operation(dev, operation, paths, dest_device=dest_dev, dest_path=dest_path)
+            elif operation == 'extract':
+                dest_dev_id = data.get('dest_device')
+                dest_path = data.get('dest_path')
+                dest_dev = next((d for d in CONFIG['devices'] if d['id'] == dest_dev_id), None) if dest_dev_id else None
+                result = file_operation(dev, operation, paths, dest_device=dest_dev, dest_path=dest_path)
+            elif operation == 'rename':
+                new_name = data.get('new_name')
+                result = file_operation(dev, operation, paths, new_name=new_name)
+            elif operation == 'mkdir':
+                new_name = data.get('new_name')
+                result = file_operation(dev, operation, paths, new_name=new_name)
+            elif operation in ('delete', 'zip'):
+                result = file_operation(dev, operation, paths)
+            else:
+                result = {"success": False, "error": f"Unknown operation: {operation}"}
+
+            self.send_json(result)
+            return
+
+        # File upload: /api/device/{id}/upload?path=/dest/folder
+        if path.startswith('/api/device/') and '/upload' in path:
+            parts = path.split('/')
+            dev_id = parts[3]
+            dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
+
+            if not dev:
+                self.send_json({"success": False, "error": "Device not found"}, 404)
+                return
+
+            parsed = urlparse(self.path)
+            query = parse_qs(parsed.query)
+            dest_path = query.get('path', ['/'])[0]
+
+            # Parse multipart form data
+            content_type = self.headers.get('Content-Type', '')
+            if 'multipart/form-data' not in content_type:
+                self.send_json({"success": False, "error": "Expected multipart/form-data"}, 400)
+                return
+
+            # Extract boundary
+            boundary = None
+            for part in content_type.split(';'):
+                part = part.strip()
+                if part.startswith('boundary='):
+                    boundary = part[9:].strip('"')
+                    break
+
+            if not boundary:
+                self.send_json({"success": False, "error": "No boundary in multipart"}, 400)
+                return
+
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+
+            # Parse multipart - simple parser for single file
+            boundary_bytes = ('--' + boundary).encode()
+            parts = body.split(boundary_bytes)
+
+            uploaded = 0
+            errors = []
+
+            for part in parts:
+                if b'Content-Disposition: form-data;' not in part:
+                    continue
+                if b'filename="' not in part:
+                    continue
+
+                # Extract filename
+                header_end = part.find(b'\r\n\r\n')
+                if header_end == -1:
+                    continue
+                header = part[:header_end].decode('utf-8', errors='ignore')
+                content = part[header_end + 4:]
+
+                # Remove trailing \r\n--
+                if content.endswith(b'\r\n'):
+                    content = content[:-2]
+                if content.endswith(b'--'):
+                    content = content[:-2]
+                if content.endswith(b'\r\n'):
+                    content = content[:-2]
+
+                # Get filename from header
+                match = re.search(r'filename="([^"]+)"', header)
+                if not match:
+                    continue
+                filename = match.group(1)
+
+                # Upload file
+                result = upload_file(dev, dest_path, filename, content)
+                if result['success']:
+                    uploaded += 1
+                else:
+                    errors.append(f"{filename}: {result['error']}")
+
+            if errors:
+                self.send_json({"success": False, "error": "; ".join(errors), "uploaded": uploaded})
+            else:
+                self.send_json({"success": True, "uploaded": uploaded})
+            return
+
+        self.send_json({"success": False, "error": "Not found"}, 404)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='DeQ - Homelab Dashboard')
+    parser.add_argument('--port', type=int, default=DEFAULT_PORT, help=f'Port to run on (default: {DEFAULT_PORT})')
+    args = parser.parse_args()
+
+    port = args.port
+
+    print(f"""
+================================================================
+              DeQ - Homelab Admin Panel
+================================================================
+  Version: {VERSION}
+  Port:    {port}
+
+  Access URL:
+  http://YOUR-IP:{port}/
+================================================================
+    """)
+
+    # Clean up stale SSH ControlMaster sockets from previous runs
+    for socket_file in glob.glob("/tmp/deq-ssh-*"):
+        try:
+            os.remove(socket_file)
+        except OSError:
+            pass
+
+    # Start task scheduler
+    task_scheduler.start()
+
+    server = HTTPServer(('0.0.0.0', port), RequestHandler)
+    print(f"Server running on port {port}...")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        task_scheduler.stop()
+        server.shutdown()
+
+# === LOGIN PAGE ===
+def get_login_page():
+    return '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#000000">
+    <title>DeQ</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: #000;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding-bottom: 15vh;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        .logo {
+            width: 120px;
+            height: 120px;
+            margin-bottom: 48px;
+            color: #e0e0e0;
+        }
+        .logo svg {
+            width: 100%;
+            height: 100%;
+        }
+        .icon-bg { fill: transparent; }
+        .icon-accent { stroke: #2ed573; }
+        input {
+            background: transparent;
+            border: 1px solid #2ed573;
+            border-radius: 8px;
+            padding: 12px 16px;
+            width: 280px;
+            color: #fff;
+            font-size: 14px;
+            outline: none;
+        }
+        input::placeholder {
+            color: #444;
+        }
+        input:focus {
+            border-color: #2ed573;
+            box-shadow: 0 0 0 1px #2ed57333;
+        }
+        .login-error {
+            color: #ff4757;
+            font-size: 12px;
+            margin-top: 12px;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+        .login-error.visible { opacity: 1; }
+    </style>
+</head>
+<body>
+    <div class="logo">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+            <rect class="icon-bg" width="512" height="512" rx="96"/>
+            <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="currentColor" stroke-width="16"/>
+            <path d="M430 155 L432 100 Q432 80 412 80 L302 80 Q282 80 282 100 L282 210 Q282 230 302 230 L430 230" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+            <line x1="400" y1="155" x2="428" y2="155" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+            <path class="icon-accent" d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke-width="16" stroke-linecap="round"/>
+            <line class="icon-accent" x1="405" y1="405" x2="435" y2="435" stroke-width="16" stroke-linecap="round"/>
+        </svg>
+    </div>
+    <form id="login-form">
+        <input type="password" id="password" placeholder="Enter Password" autocomplete="current-password" autofocus>
+    </form>
+    <div class="login-error" id="error">Invalid password</div>
+    <script>
+        document.getElementById('login-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const password = document.getElementById('password').value;
+            const res = await fetch('/auth/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({password})
+            });
+            if (res.ok) {
+                window.location.reload();
+            } else {
+                document.getElementById('error').classList.add('visible');
+                document.getElementById('password').value = '';
+                document.getElementById('password').focus();
+            }
+        });
+    </script>
+</body>
+</html>'''
 
 # === HTML TEMPLATE ===
-HTML_PAGE = '''<!DOCTYPE html>
+def get_html_page():
+    return '''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -1318,14 +2853,15 @@ HTML_PAGE = '''<!DOCTYPE html>
             background: var(--bg-primary);
             color: var(--text-primary);
             min-height: 100vh;
-            padding: 24px;
+            padding: 0;
             font-size: 12px;
             line-height: 1.4;
         }
-        
+
         .container {
-            max-width: 800px;
-            margin: 0 auto;
+            width: 100%;
+            padding: 0 6px;
+            box-sizing: border-box;
         }
         
         /* Header */
@@ -1347,7 +2883,12 @@ HTML_PAGE = '''<!DOCTYPE html>
             width: 38px;
             height: 38px;
         }
-        
+
+        #onboarding-logo svg {
+            width: 32px;
+            height: 32px;
+        }
+
         .header-actions {
             display: flex;
             gap: 12px;
@@ -1404,13 +2945,6 @@ HTML_PAGE = '''<!DOCTYPE html>
             color: var(--text-primary);
         }
 
-        #files-btn:hover,
-        #edit-toggle:hover {
-            background: var(--bg-secondary);
-            color: var(--text-primary);
-            border-color: var(--accent);
-            box-shadow: 0 0 4px var(--accent);
-        }
 
         .logo svg .icon-bg,
         #files-btn svg .icon-bg,
@@ -1441,6 +2975,11 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
 
         .edit-mode .section-hidden > *:not(.section-header) {
+            display: none;
+        }
+
+        /* Empty sections: hidden until edit mode */
+        .section-empty {
             display: none;
         }
 
@@ -1492,59 +3031,24 @@ HTML_PAGE = '''<!DOCTYPE html>
             pointer-events: auto;
         }
 
-        .edit-mode .section-add,
-        .edit-mode .section-add svg,
-        .edit-mode .layout-btn {
-            color: #fff;
-        }
-
-        .layout-btn {
-            font-size: 12px;
-            font-weight: 500;
-            min-width: 36px;
+        .edit-mode .icon-btn.section-add,
+        .edit-mode .icon-btn.section-add svg {
+            color: var(--text-primary);
         }
 
         /* Links */
-        .links-grid {
-            display: flex;
-            flex-wrap: wrap;
+        .cards-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
             gap: 8px;
         }
 
-        .links-grid.layout-1-4 {
-            flex-direction: column;
-            align-items: stretch;
-        }
-
-        .links-grid.layout-1-4 .link-item {
-            justify-content: center;
-        }
-
-        .links-grid.layout-2-4 {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-        }
-
-        .links-grid.layout-2-4 .link-item,
-        .links-grid.layout-4-4 .link-item {
+        .cards-grid .card-item {
             min-width: 0;
             width: 100%;
         }
 
-        .links-grid.layout-4-4 {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-        }
-
-        .edit-mode .links-grid.layout-2-4,
-        .edit-mode .links-grid.layout-4-4 {
-            overflow: visible;
-            padding-top: 12px;
-            padding-right: 12px;
-        }
-
-        .links-grid.layout-2-4 .link-name,
-        .links-grid.layout-4-4 .link-name {
+        .cards-grid .card-name {
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
@@ -1552,13 +3056,13 @@ HTML_PAGE = '''<!DOCTYPE html>
             min-width: 0;
         }
 
-        @media (max-width: 768px) {
-            .links-grid.layout-4-4 {
-                grid-template-columns: repeat(2, 1fr);
-            }
+        .edit-mode .cards-grid {
+            overflow: visible;
+            padding-top: 12px;
+            padding-right: 12px;
         }
         
-        .link-item {
+        .card-item {
             background: var(--bg-secondary);
             border: 1px solid var(--border);
             border-radius: 8px;
@@ -1573,28 +3077,24 @@ HTML_PAGE = '''<!DOCTYPE html>
             position: relative;
         }
         
-        .link-item:hover {
-            border-color: var(--accent);
-            background: var(--bg-tertiary);
-        }
 
-        .edit-mode .link-item {
+        .edit-mode .card-item {
             cursor: grab;
         }
 
-        .edit-mode .link-item.dragging {
+        .edit-mode .card-item.dragging {
             opacity: 0.5;
             cursor: grabbing;
         }
 
-        .edit-mode .link-item.drag-over {
+        .edit-mode .card-item.drag-over {
             border-color: var(--accent);
             box-shadow: inset 0 0 0 2px var(--accent);
             transform: scale(1.02);
         }
         
-        .link-item svg,
-        .link-item .custom-icon {
+        .card-item svg,
+        .card-item .custom-icon {
             width: 22px;
             height: 22px;
             color: var(--text-secondary);
@@ -1605,19 +3105,19 @@ HTML_PAGE = '''<!DOCTYPE html>
             filter: grayscale(1) brightness(0.7) contrast(1.2);
         }
 
-        .link-text {
+        .card-text {
             display: flex;
             flex-direction: column;
             min-width: 0;
             flex: 1;
         }
 
-        .link-name {
+        .card-name {
             font-size: 12px;
             line-height: 1.2;
         }
 
-        .link-note {
+        .card-note {
             font-size: 10px;
             line-height: 1.2;
             color: var(--text-secondary);
@@ -1628,6 +3128,7 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         /* Edit/Delete buttons (shared) */
         .link-edit, .link-delete,
+        .action-edit, .action-delete,
         .task-edit, .task-delete,
         .device-edit, .device-delete {
             display: none;
@@ -1641,29 +3142,30 @@ HTML_PAGE = '''<!DOCTYPE html>
             cursor: pointer;
         }
 
-        .link-edit, .task-edit, .device-edit {
+        .link-edit, .action-edit, .task-edit, .device-edit {
             right: 28px;
             background: var(--accent-muted);
         }
 
-        .link-delete, .task-delete, .device-delete {
+        .link-delete, .action-delete, .task-delete, .device-delete {
             right: -10px;
             background: var(--danger-muted);
         }
 
         .edit-mode .link-edit, .edit-mode .link-delete,
+        .edit-mode .action-edit, .edit-mode .action-delete,
         .edit-mode .task-edit, .edit-mode .task-delete,
         .edit-mode .device-edit, .edit-mode .device-delete {
             display: flex;
         }
 
-        .link-edit svg, .task-edit svg, .device-edit svg {
+        .link-edit svg, .action-edit svg, .task-edit svg, .device-edit svg {
             width: 16px;
             height: 16px;
             color: white;
         }
 
-        .link-delete svg, .task-delete svg, .device-delete svg {
+        .link-delete svg, .action-delete svg, .task-delete svg, .device-delete svg {
             width: 12px;
             height: 12px;
             color: white;
@@ -1691,7 +3193,6 @@ HTML_PAGE = '''<!DOCTYPE html>
             border: 1px solid var(--border);
             border-radius: 12px;
             padding: 16px;
-            margin-bottom: 12px;
             position: relative;
         }
 
@@ -2117,12 +3618,17 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
 
         /* Tasks */
+        #tasks-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 12px;
+        }
+
         .task-card {
             background: var(--bg-secondary);
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 16px;
-            margin-bottom: 12px;
             position: relative;
         }
 
@@ -2189,6 +3695,21 @@ HTML_PAGE = '''<!DOCTYPE html>
             50% { opacity: 0.4; }
         }
 
+        .edit-mode .task-card {
+            cursor: grab;
+        }
+
+        .edit-mode .task-card.dragging {
+            opacity: 0.5;
+            cursor: grabbing;
+        }
+
+        .edit-mode .task-card.drag-over {
+            border-color: var(--accent);
+            box-shadow: inset 0 0 0 2px var(--accent);
+            transform: scale(1.01);
+        }
+
         .task-card.running {
             border-color: var(--accent);
         }
@@ -2217,15 +3738,6 @@ HTML_PAGE = '''<!DOCTYPE html>
             gap: 4px;
         }
 
-        .task-btn:hover {
-            border-color: var(--text-secondary);
-            color: var(--text-primary);
-        }
-
-        .task-btn.danger:hover {
-            border-color: var(--danger);
-            color: var(--danger);
-        }
 
         .task-empty {
             text-align: center;
@@ -2308,48 +3820,6 @@ HTML_PAGE = '''<!DOCTYPE html>
             height: 16px;
         }
 
-        /* History chart */
-        .device-chart {
-            height: 32px;
-            display: flex;
-            align-items: flex-end;
-            gap: 2px;
-            margin-bottom: 8px;
-        }
-        
-        .chart-bar {
-            flex: 1;
-            background: var(--accent);
-            opacity: 0.6;
-            border-radius: 2px 2px 0 0;
-            min-height: 2px;
-        }
-        
-        .chart-bar:hover {
-            opacity: 1;
-        }
-        
-        .device-chart-footer {
-            display: flex;
-            justify-content: space-between;
-            font-size: 11px;
-            color: var(--text-secondary);
-            margin-bottom: 12px;
-        }
-        
-        .chart-period-select {
-            background: none;
-            border: none;
-            color: var(--text-secondary);
-            font-family: inherit;
-            font-size: 11px;
-            cursor: pointer;
-        }
-        
-        .chart-period-select:hover {
-            color: var(--text-primary);
-        }
-        
         .device-actions {
             display: flex;
             flex-wrap: wrap;
@@ -2466,6 +3936,38 @@ HTML_PAGE = '''<!DOCTYPE html>
             grid-template-columns: repeat(3, 1fr);
             gap: 16px;
             margin-bottom: 16px;
+        }
+
+        /* Hover states - only on devices with pointer */
+        @media (hover: hover) {
+            #files-btn:hover,
+            #edit-toggle:hover {
+                background: var(--bg-secondary);
+                color: var(--text-primary);
+                border-color: var(--accent);
+                box-shadow: 0 0 4px var(--accent);
+            }
+            .card-item:hover {
+                border-color: var(--accent);
+                background: var(--bg-tertiary);
+            }
+            .task-btn:hover {
+                border-color: var(--text-secondary);
+                color: var(--text-primary);
+            }
+            .task-btn.danger:hover {
+                border-color: var(--danger);
+                color: var(--danger);
+            }
+            .fm-btn:hover:not(:disabled) {
+                background: var(--accent);
+                border-color: var(--accent);
+                color: var(--bg-primary);
+            }
+            .fm-btn.danger:hover:not(:disabled) {
+                background: var(--danger);
+                border-color: var(--danger);
+            }
         }
 
         @media (max-width: 600px) {
@@ -2588,7 +4090,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             background-attachment: fixed;
         }
 
-        body.has-wallpaper .link-item,
+        body.has-wallpaper .card-item,
         body.has-wallpaper .device-card,
         body.has-wallpaper .task-card,
         body.has-wallpaper .theme-section,
@@ -2641,7 +4143,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             align-items: center;
             justify-content: center;
             z-index: 1000;
-            padding: 24px;
+            padding: 10px;
         }
         
         .modal.visible {
@@ -2654,7 +4156,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             border-radius: 12px;
             padding: 24px;
             width: 100%;
-            max-width: 500px;
+            max-width: 800px;
             max-height: 92vh;
             overflow-y: auto;
         }
@@ -2888,31 +4390,42 @@ HTML_PAGE = '''<!DOCTYPE html>
             border-bottom: 1px solid var(--border);
         }
 
+        .fm-header-row {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
         .fm-pane-header select {
-            width: 100%;
-            margin-bottom: 8px;
+            flex: 1;
+            min-width: 0;
+            font-size: 11px;
+            text-overflow: ellipsis;
         }
 
         .fm-storage {
+            flex: 1;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 6px;
             font-size: 11px;
             color: var(--text-secondary);
-            margin-bottom: 6px;
+            min-width: 0;
         }
 
         .fm-storage-text {
             white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         .fm-storage-bar {
-            flex: 1;
+            flex-shrink: 0;
+            width: 50px;
             height: 6px;
             background: var(--bg-primary);
             border-radius: 3px;
             overflow: hidden;
-            max-width: 80px;
         }
 
         .fm-storage-fill {
@@ -2922,7 +4435,8 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
 
         .fm-storage-percent {
-            min-width: 32px;
+            flex-shrink: 0;
+            min-width: 28px;
             text-align: right;
         }
 
@@ -2930,7 +4444,11 @@ HTML_PAGE = '''<!DOCTYPE html>
             font-family: monospace;
             font-size: 11px;
             color: var(--text-secondary);
-            word-break: break-all;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            direction: rtl;
+            text-align: left;
         }
 
         .fm-list {
@@ -2948,6 +4466,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             cursor: pointer;
             border-bottom: 1px solid var(--border);
             color: var(--text-primary);
+            font-size: 11px;
             transition: background 0.1s;
         }
 
@@ -3010,19 +4529,11 @@ HTML_PAGE = '''<!DOCTYPE html>
             border-radius: 6px;
             color: var(--text-primary);
             font-family: inherit;
-            font-size: 12px;
+            font-size: 11px;
             cursor: pointer;
             transition: all 0.15s;
             position: relative;
             z-index: 1;
-        }
-
-        @media (hover: hover) {
-            .fm-btn:hover:not(:disabled) {
-                background: var(--accent);
-                border-color: var(--accent);
-                color: var(--bg-primary);
-            }
         }
 
         .fm-btn:active:not(:disabled) {
@@ -3034,13 +4545,6 @@ HTML_PAGE = '''<!DOCTYPE html>
         .fm-btn:disabled {
             opacity: 0.3;
             cursor: not-allowed;
-        }
-
-        @media (hover: hover) {
-            .fm-btn.danger:hover:not(:disabled) {
-                background: var(--danger);
-                border-color: var(--danger);
-            }
         }
 
         .fm-btn.danger:active:not(:disabled) {
@@ -3117,7 +4621,8 @@ HTML_PAGE = '''<!DOCTYPE html>
                 padding: 8px;
             }
 
-            .fm-pane-header select {
+            .fm-header-row {
+                gap: 6px;
                 margin-bottom: 4px;
             }
 
@@ -3137,7 +4642,6 @@ HTML_PAGE = '''<!DOCTYPE html>
 
             .fm-btn {
                 padding: 6px 10px;
-                font-size: 11px;
             }
         }
 
@@ -3303,10 +4807,6 @@ HTML_PAGE = '''<!DOCTYPE html>
             color: var(--text-primary);
         }
         
-        .btn-danger {
-            background: var(--danger);
-        }
-        
         .modal-actions {
             display: flex;
             flex-wrap: wrap;
@@ -3349,14 +4849,7 @@ HTML_PAGE = '''<!DOCTYPE html>
 <body>
     <div class="container">
         <header class="header">
-            <a href="https://deq.rocks" target="_blank" rel="noopener" class="logo"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect class="icon-bg" width="512" height="512" rx="96"/>
-  <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="currentColor" stroke-width="16"/>
-  <path d="M430 155 L432 100 Q432 80 412 80 L302 80 Q282 80 282 100 L282 210 Q282 230 302 230 L430 230" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
-  <line x1="400" y1="155" x2="428" y2="155" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
-  <path class="icon-accent" d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke-width="16" stroke-linecap="round"/>
-  <line class="icon-accent" x1="405" y1="405" x2="435" y2="435" stroke-width="16" stroke-linecap="round"/>
-</svg></a>
+            <a href="https://deq.rocks" target="_blank" rel="noopener" class="logo" id="header-logo"></a>
             <div class="header-actions">
                 <button class="icon-btn" id="files-btn" title="File Manager" onclick="openFileManager()">
                     <svg viewBox="0 0 512 512" fill="none">
@@ -3382,6 +4875,9 @@ HTML_PAGE = '''<!DOCTYPE html>
                         <line x1="300" y1="140" x2="372" y2="212" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
                     </svg>
                 </button>
+                <button class="icon-btn" id="logout-btn" title="Logout" onclick="logout()" style="display:none">
+                    <i data-lucide="log-out"></i>
+                </button>
             </div>
         </header>
 
@@ -3393,21 +4889,29 @@ HTML_PAGE = '''<!DOCTYPE html>
                     <button class="icon-btn section-add section-toggle" id="links-toggle" title="Hide section" onclick="toggleSection('links')">
                         <i data-lucide="eye-off"></i>
                     </button>
-                    <button class="icon-btn section-add layout-btn" id="link-layout-btn" title="Change layout" onclick="cycleLinkLayout()">
-                        <span id="link-layout-label">eco</span>
-                    </button>
                     <button class="icon-btn section-add" id="mono-toggle" title="Toggle monochrome icons" onclick="toggleMonochrome()">
                         <i data-lucide="palette"></i>
                     </button>
                 </div>
-                <button class="icon-btn section-add" id="add-link" title="Add link">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="12" y1="5" x2="12" y2="19"></line>
-                        <line x1="5" y1="12" x2="19" y2="12"></line>
-                    </svg>
+                <button class="icon-btn section-add icon-plus" id="add-link" title="Add link"></button>
+            </div>
+            <div class="cards-grid" id="cards-grid"></div>
+        </section>
+
+        <!-- Quick Actions -->
+        <section class="section" id="actions-section">
+            <div class="section-header">
+                <div class="section-header-left">
+                    <span class="section-title">Scripts</span>
+                    <button class="icon-btn section-add section-toggle" id="actions-toggle" title="Hide section" onclick="toggleSection('actions')">
+                        <i data-lucide="eye-off"></i>
+                    </button>
+                </div>
+                <button class="icon-btn section-add" id="scan-actions" title="Scan for scripts" onclick="scanQuickActions()">
+                    <i data-lucide="radar"></i>
                 </button>
             </div>
-            <div class="links-grid" id="links-grid"></div>
+            <div class="cards-grid" id="actions-grid"></div>
         </section>
 
         <!-- Devices -->
@@ -3425,12 +4929,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 <button class="icon-btn section-add" id="scan-devices" title="Scan for devices" onclick="startOnboarding(true)">
                     <i data-lucide="radar"></i>
                 </button>
-                <button class="icon-btn section-add" id="add-device" title="Add device">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="12" y1="5" x2="12" y2="19"></line>
-                        <line x1="5" y1="12" x2="19" y2="12"></line>
-                    </svg>
-                </button>
+                <button class="icon-btn section-add icon-plus" id="add-device" title="Add device"></button>
             </div>
             <div class="devices-list"  id="devices-list"></div>
         </section>
@@ -3444,12 +4943,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                         <i data-lucide="eye-off"></i>
                     </button>
                 </div>
-                <button class="icon-btn section-add task-add" onclick="openTaskWizard()" title="Add task">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="12" y1="5" x2="12" y2="19"></line>
-                        <line x1="5" y1="12" x2="19" y2="12"></line>
-                    </svg>
-                </button>
+                <button class="icon-btn section-add task-add icon-plus" onclick="openTaskWizard()" title="Add task"></button>
             </div>
             <div id="tasks-list"></div>
         </section>
@@ -3539,18 +5033,13 @@ HTML_PAGE = '''<!DOCTYPE html>
         <div class="modal-content">
             <div class="modal-header">
                 <span class="modal-title" id="link-modal-title">Add Link</span>
-                <button class="modal-close" onclick="closeModal('link-modal')">
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                    </svg>
-                </button>
+                <button class="modal-close" onclick="closeModal('link-modal')"></button>
             </div>
             <form id="link-form">
                 <input type="hidden" id="link-id">
                 <div class="form-group">
                     <label class="form-label">Name</label>
-                    <input type="text" class="form-input" id="link-name" required>
+                    <input type="text" class="form-input" id="card-name" required>
                 </div>
                 <div class="form-group">
                     <label class="form-label">URL</label>
@@ -3563,7 +5052,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Note</label>
-                    <input type="text" class="form-input" id="link-note" placeholder="Optional, e.g. Runs on NAS">
+                    <input type="text" class="form-input" id="card-note" placeholder="Optional, e.g. Runs on NAS">
                 </div>
                 <div class="modal-actions">
                     <button type="button" class="btn btn-secondary" onclick="closeModal('link-modal')">Cancel</button>
@@ -3572,7 +5061,56 @@ HTML_PAGE = '''<!DOCTYPE html>
             </form>
         </div>
     </div>
-    
+
+    <!-- Quick Action Scan Modal -->
+    <div class="modal" id="qa-scan-modal">
+        <div class="modal-content" style="max-width: 600px;">
+            <div class="modal-header">
+                <span class="modal-title">Scan for Scripts</span>
+                <button class="modal-close" onclick="closeModal('qa-scan-modal')"></button>
+            </div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-bottom: 12px;">
+                Executable scripts in /opt/deq/scripts/
+            </div>
+            <div id="qa-scan-list" style="max-height: 400px; overflow-y: auto;"></div>
+            <div class="modal-actions">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('qa-scan-modal')">Cancel</button>
+                <button type="button" class="btn" onclick="addScannedActions()">Add Selected</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quick Action Edit Modal -->
+    <div class="modal" id="qa-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span class="modal-title" id="qa-modal-title">Edit Script</span>
+                <button class="modal-close" onclick="closeModal('qa-modal')"></button>
+            </div>
+            <form id="qa-form" onsubmit="saveQuickAction(event)">
+                <input type="hidden" id="qa-id">
+                <input type="hidden" id="qa-path">
+                <div class="form-group">
+                    <label class="form-label">Name</label>
+                    <input type="text" class="form-input" id="qa-name" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Icon</label>
+                    <input type="text" class="form-input" id="qa-icon" placeholder="e.g. terminal, play, zap">
+                    <div class="form-hint">Lucide icon name</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Note</label>
+                    <input type="text" class="form-input" id="qa-note" placeholder="Optional description">
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('qa-modal')">Cancel</button>
+                    <button type="submit" class="btn">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- Device Modal -->
     <div class="modal" id="device-modal">
         <div class="modal-content">
@@ -3582,12 +5120,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                     <button type="button" class="icon-btn" onclick="document.getElementById('device-help').classList.toggle('visible')" title="Help">
                         <i data-lucide="circle-help" style="width: 18px; height: 18px;"></i>
                     </button>
-                    <button class="modal-close" onclick="closeModal('device-modal')">
-                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-                            <line x1="18" y1="6" x2="6" y2="18"></line>
-                            <line x1="6" y1="6" x2="18" y2="18"></line>
-                        </svg>
-                    </button>
+                    <button class="modal-close" onclick="closeModal('device-modal')"></button>
                 </div>
             </div>
             <div id="device-help" class="help-accordion">
@@ -3688,12 +5221,7 @@ HTML_PAGE = '''<!DOCTYPE html>
         <div class="modal-content" style="max-width: 500px;">
             <div class="modal-header">
                 <span class="modal-title" id="task-modal-title">New Task</span>
-                <button class="modal-close" onclick="closeModal('task-modal')">
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                    </svg>
-                </button>
+                <button class="modal-close" onclick="closeModal('task-modal')"></button>
             </div>
             <form onsubmit="saveTask(event)">
                 <input type="hidden" id="task-id">
@@ -3707,16 +5235,24 @@ HTML_PAGE = '''<!DOCTYPE html>
                                 <input type="radio" name="task-action" value="wake" checked>
                                 <span class="task-type-label">
                                     <i data-lucide="power"></i>
-                                    <strong>Wake</strong>
-                                    <small>Power on or start</small>
+                                    <strong>Power On</strong>
+                                    <small>Devices or containers</small>
                                 </span>
                             </label>
                             <label class="task-type-option">
                                 <input type="radio" name="task-action" value="shutdown">
                                 <span class="task-type-label">
                                     <i data-lucide="power-off"></i>
-                                    <strong>Shutdown</strong>
-                                    <small>Power off or stop</small>
+                                    <strong>Power Off</strong>
+                                    <small>Devices or containers</small>
+                                </span>
+                            </label>
+                            <label class="task-type-option">
+                                <input type="radio" name="task-action" value="suspend">
+                                <span class="task-type-label">
+                                    <i data-lucide="moon"></i>
+                                    <strong>Suspend</strong>
+                                    <small>Devices only</small>
                                 </span>
                             </label>
                             <label class="task-type-option">
@@ -3725,6 +5261,14 @@ HTML_PAGE = '''<!DOCTYPE html>
                                     <i data-lucide="folder-sync"></i>
                                     <strong>Backup</strong>
                                     <small>Sync files between devices</small>
+                                </span>
+                            </label>
+                            <label class="task-type-option">
+                                <input type="radio" name="task-action" value="script">
+                                <span class="task-type-label">
+                                    <i data-lucide="terminal"></i>
+                                    <strong>Script</strong>
+                                    <small>Run a script on the host</small>
                                 </span>
                             </label>
                         </div>
@@ -3738,7 +5282,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 <!-- Step 2: Target Type (Device or Docker) - only for wake/shutdown -->
                 <div class="wizard-step" id="wizard-step-2" style="display: none;">
                     <div class="form-section">
-                        <div class="form-section-title">What do you want to <span id="step2-action">wake</span>?</div>
+                        <div class="form-section-title">What do you want to <span id="step2-action">power on</span>?</div>
                         <div class="task-type-options">
                             <label class="task-type-option">
                                 <input type="radio" name="task-target" value="device" checked>
@@ -3896,6 +5440,25 @@ HTML_PAGE = '''<!DOCTYPE html>
                         <button type="submit" class="btn">Create Task</button>
                     </div>
                 </div>
+
+                <!-- Step 8: Script Selection -->
+                <div class="wizard-step" id="wizard-step-8" style="display: none;">
+                    <div class="form-section">
+                        <div class="form-section-title">Script</div>
+                        <div class="form-group">
+                            <label class="form-label">Select Script</label>
+                            <select class="form-input" id="task-script"></select>
+                        </div>
+                        <div style="font-size: 11px; color: var(--text-secondary); margin-top: 8px;">
+                            Scripts from /opt/deq/scripts/
+                        </div>
+                    </div>
+                    <div class="wizard-nav">
+                        <button type="button" class="btn btn-secondary" onclick="wizardBack()">Back</button>
+                        <button type="button" class="btn" onclick="wizardNext()">Next</button>
+                    </div>
+                </div>
+
             </form>
         </div>
     </div>
@@ -3905,40 +5468,38 @@ HTML_PAGE = '''<!DOCTYPE html>
         <div class="modal-content fm-modal">
             <div class="modal-header">
                 <span class="modal-title">File Manager</span>
-                <button class="modal-close" onclick="closeModal('fm-modal')">
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                    </svg>
-                </button>
+                <button class="modal-close" onclick="closeModal('fm-modal')"></button>
             </div>
             <div class="fm-container">
                 <div class="fm-pane" id="fm-left">
                     <div class="fm-pane-header">
-                        <select class="form-input" id="fm-left-device" onchange="fmLoadFiles('left')"></select>
-                        <div class="fm-storage" id="fm-left-storage"></div>
+                        <div class="fm-header-row">
+                            <select class="form-input" id="fm-left-device" onchange="fmLoadFiles('left')"></select>
+                            <div class="fm-storage" id="fm-left-storage"></div>
+                        </div>
                         <div class="fm-path" id="fm-left-path">/</div>
                     </div>
                     <div class="fm-list" id="fm-left-list"></div>
                 </div>
                 <div class="fm-pane" id="fm-right">
                     <div class="fm-pane-header">
-                        <select class="form-input" id="fm-right-device" onchange="fmLoadFiles('right')"></select>
-                        <div class="fm-storage" id="fm-right-storage"></div>
+                        <div class="fm-header-row">
+                            <select class="form-input" id="fm-right-device" onchange="fmLoadFiles('right')"></select>
+                            <div class="fm-storage" id="fm-right-storage"></div>
+                        </div>
                         <div class="fm-path" id="fm-right-path">/</div>
                     </div>
                     <div class="fm-list" id="fm-right-list"></div>
                 </div>
             </div>
             <div class="fm-actions">
-                <button class="fm-btn" id="fm-copy-right" onclick="fmCopy('left', 'right')" disabled>Copy →</button>
-                <button class="fm-btn" id="fm-copy-left" onclick="fmCopy('right', 'left')" disabled>← Copy</button>
-                <button class="fm-btn" id="fm-move-right" onclick="fmMove('left', 'right')" disabled>Move →</button>
-                <button class="fm-btn" id="fm-move-left" onclick="fmMove('right', 'left')" disabled>← Move</button>
+                <button class="fm-btn" id="fm-copy" onclick="fmCopy()" disabled>Copy</button>
+                <button class="fm-btn" id="fm-move" onclick="fmMove()" disabled>Move</button>
                 <button class="fm-btn" id="fm-newfolder" onclick="fmNewFolder()" disabled>New Folder</button>
                 <button class="fm-btn" id="fm-rename" onclick="fmRename()" disabled>Rename</button>
                 <button class="fm-btn danger" id="fm-delete" onclick="fmDelete()" disabled>Delete</button>
                 <button class="fm-btn" id="fm-zip" onclick="fmZip()" disabled>Zip</button>
+                <button class="fm-btn" id="fm-extract" onclick="fmExtract()" disabled>Extract</button>
                 <button class="fm-btn" id="fm-download" onclick="fmDownload()" disabled>Download</button>
                 <button class="fm-btn" id="fm-upload" onclick="document.getElementById('fm-upload-input').click()">Upload</button>
                 <input type="file" id="fm-upload-input" multiple style="display:none" onchange="fmUploadFiles(this.files)">
@@ -3960,22 +5521,10 @@ HTML_PAGE = '''<!DOCTYPE html>
         <div class="modal-content" style="max-width: 700px;">
             <div class="modal-header">
                 <div style="display: flex; align-items: center; gap: 12px;">
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" style="width: 32px; height: 32px;">
-                        <rect class="icon-bg" width="512" height="512" rx="96"/>
-                        <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="currentColor" stroke-width="16"/>
-                        <path d="M430 155 L432 100 Q432 80 412 80 L302 80 Q282 80 282 100 L282 210 Q282 230 302 230 L430 230" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
-                        <line x1="400" y1="155" x2="428" y2="155" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
-                        <path class="icon-accent" d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke-width="16" stroke-linecap="round"/>
-                        <line class="icon-accent" x1="405" y1="405" x2="435" y2="435" stroke-width="16" stroke-linecap="round"/>
-                    </svg>
+                    <span id="onboarding-logo" style="width: 32px; height: 32px;"></span>
                     <span class="modal-title" id="onboarding-title">Welcome to DeQ!</span>
                 </div>
-                <button class="modal-close" onclick="closeOnboarding(true)">
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                    </svg>
-                </button>
+                <button class="modal-close" onclick="closeOnboarding(true)"></button>
             </div>
             <div id="onboarding-content">
                 <div id="onboarding-loading" style="text-align: center; padding: 40px;">
@@ -4012,12 +5561,7 @@ HTML_PAGE = '''<!DOCTYPE html>
         <div class="modal-content" style="max-width: 700px;">
             <div class="modal-header">
                 <span class="modal-title" id="stats-modal-title">Device Stats</span>
-                <button class="modal-close" onclick="closeModal('stats-modal')">
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                    </svg>
-                </button>
+                <button class="modal-close" onclick="closeModal('stats-modal')"></button>
             </div>
             <div id="stats-modal-content">
                 <div id="stats-loading" style="text-align: center; padding: 40px;">
@@ -4095,12 +5639,7 @@ HTML_PAGE = '''<!DOCTYPE html>
         <div class="modal-content" style="max-width: 500px;">
             <div class="modal-header">
                 <span class="modal-title">Scan for Docker containers?</span>
-                <button class="modal-close" onclick="closeDockerScan()">
-                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="18" y1="6" x2="6" y2="18"></line>
-                        <line x1="6" y1="6" x2="18" y2="18"></line>
-                    </svg>
-                </button>
+                <button class="modal-close" onclick="closeDockerScan()"></button>
             </div>
             <div id="docker-scan-content">
                 <div id="docker-scan-checking" style="text-align: center; padding: 30px;">
@@ -4144,6 +5683,20 @@ HTML_PAGE = '''<!DOCTYPE html>
         let config = {settings: {}, links: [], devices: []};
         let editMode = false;
         let deviceStats = {};
+
+        const LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+          <rect class="icon-bg" width="512" height="512" rx="96"/>
+          <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="currentColor" stroke-width="16"/>
+          <path d="M430 155 L432 100 Q432 80 412 80 L302 80 Q282 80 282 100 L282 210 Q282 230 302 230 L430 230" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+          <line x1="400" y1="155" x2="428" y2="155" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+          <path class="icon-accent" d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke-width="16" stroke-linecap="round"/>
+          <line class="icon-accent" x1="405" y1="405" x2="435" y2="435" stroke-width="16" stroke-linecap="round"/>
+        </svg>`;
+
+        const ICON_CLOSE = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`;
+        const ICON_PLUS = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>`;
+        const ICON_EDIT = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path><path d="m15 5 4 4"></path></svg>`;
+        const ICON_DELETE = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="20" y1="4" x2="4" y2="20"></line><line x1="4" y1="4" x2="20" y2="20"></line></svg>`;
 
         // Platform detection
         const ua = navigator.userAgent;
@@ -4231,11 +5784,21 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         // Toggle between bar and value display
         let showValues = false;
+        let showValuesTimer = null;
         function toggleStatsMode(el) {
+            if (showValuesTimer) clearTimeout(showValuesTimer);
             showValues = !showValues;
             document.querySelectorAll('.device-stats-bars').forEach(bars => {
                 bars.classList.toggle('show-values', showValues);
             });
+            if (showValues) {
+                showValuesTimer = setTimeout(() => {
+                    showValues = false;
+                    document.querySelectorAll('.device-stats-bars').forEach(bars => {
+                        bars.classList.remove('show-values');
+                    });
+                }, 5000);
+            }
         }
 
         // === Render Functions ===
@@ -4478,53 +6041,56 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         function applySectionVisibility() {
             const showLinks = config.settings.show_links !== false;
+            const showActions = config.settings.show_actions !== false;
             const showDevices = config.settings.show_devices !== false;
             const showTasks = config.settings.show_tasks !== false;
+            const isEditMode = document.body.classList.contains('edit-mode');
 
             const linksSection = document.getElementById('links-section');
+            const actionsSection = document.getElementById('actions-section');
             const devicesSection = document.getElementById('devices-section');
             const tasksSection = document.getElementById('tasks-section');
 
+            // Empty sections only visible in edit mode
+            const linksEmpty = !config.links || config.links.length === 0;
+            const actionsEmpty = !config.quick_actions || config.quick_actions.length === 0;
+
             // Hidden sections: collapsed with only header visible in edit mode
             linksSection.classList.toggle('section-hidden', !showLinks);
+            linksSection.classList.toggle('section-empty', linksEmpty && !isEditMode);
+            if (actionsSection) {
+                actionsSection.classList.toggle('section-hidden', !showActions);
+                actionsSection.classList.toggle('section-empty', actionsEmpty && !isEditMode);
+            }
             devicesSection.classList.toggle('section-hidden', !showDevices);
             tasksSection.classList.toggle('section-hidden', !showTasks);
 
             // Update toggle icons
             const linksToggle = document.getElementById('links-toggle');
+            const actionsToggle = document.getElementById('actions-toggle');
             const devicesToggle = document.getElementById('devices-toggle');
             const tasksToggle = document.getElementById('tasks-toggle');
             if (linksToggle) linksToggle.innerHTML = showLinks ? '<i data-lucide="eye-off"></i>' : '<i data-lucide="eye"></i>';
+            if (actionsToggle) actionsToggle.innerHTML = showActions ? '<i data-lucide="eye-off"></i>' : '<i data-lucide="eye"></i>';
             if (devicesToggle) devicesToggle.innerHTML = showDevices ? '<i data-lucide="eye-off"></i>' : '<i data-lucide="eye"></i>';
             if (tasksToggle) tasksToggle.innerHTML = showTasks ? '<i data-lucide="eye-off"></i>' : '<i data-lucide="eye"></i>';
             refreshIcons();
         }
 
         function renderLinks() {
-            const grid = document.getElementById('links-grid');
+            const grid = document.getElementById('cards-grid');
             grid.innerHTML = config.links.map(link => `
-                <a href="${link.url}" target="_blank" class="link-item" data-id="${link.id}"
+                <a href="${link.url}" target="_blank" class="card-item" data-id="${link.id}"
                    draggable="true" ondragstart="linkDragStart(event)" ondragover="linkDragOver(event)" ondragleave="linkDragLeave(event)" ondrop="linkDrop(event)" ondragend="linkDragEnd(event)">
                     ${getIcon(link.icon || 'link')}
-                    <div class="link-text">
-                        <span class="link-name">${link.name}</span>
-                        ${link.note ? `<span class="link-note">${link.note}</span>` : ''}
+                    <div class="card-text">
+                        <span class="card-name">${link.name}</span>
+                        ${link.note ? `<span class="card-note">${link.note}</span>` : ''}
                     </div>
-                    <div class="link-edit" onclick="event.preventDefault(); editLink('${link.id}')">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path>
-                            <path d="m15 5 4 4"></path>
-                        </svg>
-                    </div>
-                    <div class="link-delete" onclick="event.preventDefault(); deleteLink('${link.id}')">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <line x1="20" y1="4" x2="4" y2="20"></line>
-                            <line x1="4" y1="4" x2="20" y2="20"></line>
-                        </svg>
-                    </div>
+                    <div class="link-edit" onclick="event.preventDefault(); editLink('${link.id}')">${ICON_EDIT}</div>
+                    <div class="link-delete" onclick="event.preventDefault(); deleteLink('${link.id}')">${ICON_DELETE}</div>
                 </a>
             `).join('');
-            applyLinkLayout();
             refreshIcons();
         }
 
@@ -4535,28 +6101,28 @@ HTML_PAGE = '''<!DOCTYPE html>
                 e.preventDefault();
                 return;
             }
-            draggedLinkId = e.target.closest('.link-item').dataset.id;
-            e.target.closest('.link-item').classList.add('dragging');
+            draggedLinkId = e.target.closest('.card-item').dataset.id;
+            e.target.closest('.card-item').classList.add('dragging');
             e.dataTransfer.effectAllowed = 'move';
         }
 
         function linkDragOver(e) {
             if (!draggedLinkId) return;
             e.preventDefault();
-            const target = e.target.closest('.link-item');
+            const target = e.target.closest('.card-item');
             if (target && target.dataset.id !== draggedLinkId) {
                 target.classList.add('drag-over');
             }
         }
 
         function linkDragLeave(e) {
-            const target = e.target.closest('.link-item');
+            const target = e.target.closest('.card-item');
             if (target) target.classList.remove('drag-over');
         }
 
         function linkDrop(e) {
             e.preventDefault();
-            const target = e.target.closest('.link-item');
+            const target = e.target.closest('.card-item');
             if (!target || !draggedLinkId) return;
 
             const targetId = target.dataset.id;
@@ -4578,9 +6144,183 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         function linkDragEnd(e) {
             draggedLinkId = null;
-            document.querySelectorAll('.link-item').forEach(el => {
+            document.querySelectorAll('.card-item').forEach(el => {
                 el.classList.remove('dragging', 'drag-over');
             });
+        }
+
+        // === Quick Actions ===
+        function renderQuickActions() {
+            const grid = document.getElementById('actions-grid');
+            if (!grid) return;
+            const actions = config.quick_actions || [];
+            if (actions.length === 0) {
+                grid.innerHTML = '';
+                return;
+            }
+            grid.innerHTML = actions.map(qa => {
+                const exists = qa.exists !== false;
+                return `
+                <div class="card-item${exists ? '' : ' qa-missing'}" data-id="${qa.id}"
+                   draggable="true" ondragstart="qaDragStart(event)" ondragover="qaDragOver(event)" ondragleave="qaDragLeave(event)" ondrop="qaDrop(event)" ondragend="qaDragEnd(event)"
+                   onclick="runQuickAction('${qa.id}')" style="cursor: pointer;">
+                    ${getIcon(qa.icon || 'terminal')}
+                    <div class="card-text">
+                        <span class="card-name">${qa.name}</span>
+                        ${qa.note ? `<span class="card-note">${qa.note}</span>` : ''}
+                    </div>
+                    <div class="action-edit" onclick="event.stopPropagation(); editQuickAction('${qa.id}')">${ICON_EDIT}</div>
+                    <div class="action-delete" onclick="event.stopPropagation(); deleteQuickAction('${qa.id}')">${ICON_DELETE}</div>
+                </div>`;
+            }).join('');
+            refreshIcons();
+        }
+
+        async function runQuickAction(id) {
+            if (document.body.classList.contains('edit-mode')) return;
+            const qa = config.quick_actions.find(q => q.id === id);
+            if (!qa) return;
+            try {
+                const res = await api(`quick-action/${id}/run`);
+                if (res.success) {
+                    toast('Script started');
+                } else {
+                    toast(res.error || 'Failed to start script', 'error');
+                }
+            } catch (e) {
+                toast('Failed to run script', 'error');
+            }
+        }
+
+        function editQuickAction(id) {
+            const qa = config.quick_actions.find(q => q.id === id);
+            if (!qa) return;
+            document.getElementById('qa-id').value = qa.id;
+            document.getElementById('qa-name').value = qa.name;
+            document.getElementById('qa-path').value = qa.path;
+            document.getElementById('qa-icon').value = qa.icon || '';
+            document.getElementById('qa-note').value = qa.note || '';
+            document.getElementById('qa-modal-title').textContent = 'Edit Script';
+            openModal('qa-modal');
+        }
+
+        function deleteQuickAction(id) {
+            config.quick_actions = config.quick_actions.filter(q => q.id !== id);
+            saveConfig();
+            renderQuickActions();
+            applySectionVisibility();
+        }
+
+        function saveQuickAction(e) {
+            e.preventDefault();
+            const id = document.getElementById('qa-id').value;
+            const qa = config.quick_actions.find(q => q.id === id);
+            if (!qa) return;
+            qa.name = document.getElementById('qa-name').value;
+            qa.icon = document.getElementById('qa-icon').value || 'terminal';
+            qa.note = document.getElementById('qa-note').value;
+            saveConfig();
+            renderQuickActions();
+            closeModal('qa-modal');
+        }
+
+        let draggedQaId = null;
+
+        function qaDragStart(e) {
+            if (!document.body.classList.contains('edit-mode')) {
+                e.preventDefault();
+                return;
+            }
+            draggedQaId = e.target.closest('.card-item').dataset.id;
+            e.target.closest('.card-item').classList.add('dragging');
+            e.dataTransfer.effectAllowed = 'move';
+        }
+
+        function qaDragOver(e) {
+            if (!draggedQaId) return;
+            e.preventDefault();
+            const target = e.target.closest('.card-item');
+            if (target && target.dataset.id !== draggedQaId) {
+                target.classList.add('drag-over');
+            }
+        }
+
+        function qaDragLeave(e) {
+            const target = e.target.closest('.card-item');
+            if (target) target.classList.remove('drag-over');
+        }
+
+        function qaDrop(e) {
+            e.preventDefault();
+            const target = e.target.closest('.card-item');
+            if (!target || !draggedQaId) return;
+            const targetId = target.dataset.id;
+            if (targetId === draggedQaId) return;
+            const fromIdx = config.quick_actions.findIndex(q => q.id === draggedQaId);
+            const toIdx = config.quick_actions.findIndex(q => q.id === targetId);
+            const [moved] = config.quick_actions.splice(fromIdx, 1);
+            config.quick_actions.splice(toIdx, 0, moved);
+            saveConfig();
+            renderQuickActions();
+        }
+
+        function qaDragEnd(e) {
+            draggedQaId = null;
+            document.querySelectorAll('#actions-grid .card-item').forEach(el => {
+                el.classList.remove('dragging', 'drag-over');
+            });
+        }
+
+        async function scanQuickActions() {
+            openModal('qa-scan-modal');
+            document.getElementById('qa-scan-list').innerHTML = '<div style="text-align: center; padding: 20px;">Scanning...</div>';
+            try {
+                const res = await api('scripts/scan');
+                const scripts = res.scripts || [];
+                const existing = new Set((config.quick_actions || []).map(q => q.path));
+                if (scripts.length === 0) {
+                    document.getElementById('qa-scan-list').innerHTML = '<div style="padding: 20px; color: var(--text-secondary);">No executable scripts found in /opt/deq/scripts/</div>';
+                    document.querySelector('#qa-scan-modal .btn:not(.btn-secondary)').style.display = 'none';
+                    return;
+                }
+                document.querySelector('#qa-scan-modal .btn:not(.btn-secondary)').style.display = '';
+                document.getElementById('qa-scan-list').innerHTML = scripts.map(s => {
+                    const isNew = !existing.has(s.path);
+                    return `
+                    <div class="onboarding-row${isNew ? '' : ' disabled'}">
+                        <input type="checkbox" ${isNew ? 'checked' : 'disabled'} data-path="${s.path}" data-name="${s.name}">
+                        <span class="ob-ip">${s.path}</span>
+                        <input type="text" class="ob-name" placeholder="Name" ${isNew ? '' : 'disabled'}>
+                        <input type="text" class="ob-ssh" placeholder="Icon" ${isNew ? '' : 'disabled'}>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                document.getElementById('qa-scan-list').innerHTML = '<div style="padding: 20px; color: var(--text-secondary);">Failed to scan scripts</div>';
+            }
+        }
+
+        function addScannedActions() {
+            const rows = document.querySelectorAll('#qa-scan-list .onboarding-row:not(.disabled)');
+            rows.forEach(row => {
+                const checkbox = row.querySelector('input[type="checkbox"]');
+                if (!checkbox.checked) return;
+                const path = checkbox.dataset.path;
+                const inputs = row.querySelectorAll('input[type="text"]');
+                const name = inputs[0].value || checkbox.dataset.name.replace(/\.[^/.]+$/, '');
+                const icon = inputs[1].value || 'terminal';
+                config.quick_actions = config.quick_actions || [];
+                config.quick_actions.push({
+                    id: 'qa-' + Date.now() + '-' + Math.random().toString(36).substr(2, 5),
+                    path: path,
+                    name: name,
+                    icon: icon,
+                    note: ''
+                });
+            });
+            saveConfig();
+            renderQuickActions();
+            applySectionVisibility();
+            closeModal('qa-scan-modal');
         }
 
         // Device drag & drop
@@ -4639,6 +6379,59 @@ HTML_PAGE = '''<!DOCTYPE html>
             });
         }
 
+        // Task drag & drop
+        let draggedTaskId = null;
+
+        function taskDragStart(e) {
+            if (!document.body.classList.contains('edit-mode')) {
+                e.preventDefault();
+                return;
+            }
+            draggedTaskId = e.target.closest('.task-card').dataset.id;
+            e.target.closest('.task-card').classList.add('dragging');
+            e.dataTransfer.effectAllowed = 'move';
+        }
+
+        function taskDragOver(e) {
+            if (!draggedTaskId) return;
+            e.preventDefault();
+            const target = e.target.closest('.task-card');
+            if (target && target.dataset.id !== draggedTaskId) {
+                target.classList.add('drag-over');
+            }
+        }
+
+        function taskDragLeave(e) {
+            const target = e.target.closest('.task-card');
+            if (target) target.classList.remove('drag-over');
+        }
+
+        function taskDrop(e) {
+            e.preventDefault();
+            const target = e.target.closest('.task-card');
+            if (!target || !draggedTaskId) return;
+
+            const targetId = target.dataset.id;
+            if (targetId === draggedTaskId) return;
+
+            const tasks = config.tasks || [];
+            const fromIdx = tasks.findIndex(t => t.id === draggedTaskId);
+            const toIdx = tasks.findIndex(t => t.id === targetId);
+
+            const [moved] = tasks.splice(fromIdx, 1);
+            tasks.splice(toIdx, 0, moved);
+
+            saveConfig();
+            renderTasks();
+        }
+
+        function taskDragEnd(e) {
+            draggedTaskId = null;
+            document.querySelectorAll('.task-card').forEach(el => {
+                el.classList.remove('dragging', 'drag-over');
+            });
+        }
+
         function editLink(id) {
             const link = config.links.find(l => l.id === id);
             if (link) openLinkModal(link);
@@ -4661,7 +6454,8 @@ HTML_PAGE = '''<!DOCTYPE html>
                 if (dev.connect?.rdp) actions.push(`<button class="device-action" onclick="event.stopPropagation(); doConnect('${dev.id}', 'rdp')" ${!online ? 'disabled' : ''}>RDP</button>`);
                 if (dev.connect?.vnc) actions.push(`<button class="device-action" onclick="event.stopPropagation(); doConnect('${dev.id}', 'vnc')" ${!online ? 'disabled' : ''}>VNC</button>`);
                 if (dev.connect?.web) actions.push(`<button class="device-action" onclick="event.stopPropagation(); doConnect('${dev.id}', 'web')" ${!online ? 'disabled' : ''}>Web</button>`);
-                // Host can always shutdown, remote devices need SSH
+                // Host can always shutdown/suspend, remote devices need SSH
+                if (isHost || dev.ssh?.user) actions.push(`<button class="device-action" onclick="event.stopPropagation(); doSuspend('${dev.id}')" ${!online ? 'disabled' : ''}>Suspend</button>`);
                 if (isHost || dev.ssh?.user) actions.push(`<button class="device-action danger" onclick="event.stopPropagation(); doShutdown('${dev.id}')" ${!online ? 'disabled' : ''}>Shutdown</button>`);
 
                 // Docker containers section
@@ -4753,7 +6547,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                         </div>
                     </div>
                     ${online && (s.cpu !== undefined) ? `
-                        <div class="device-stats-bars" onclick="toggleStatsMode(this)">
+                        <div class="device-stats-bars${showValues ? ' show-values' : ''}" onclick="toggleStatsMode(this)">
                             <div class="stat-bar-group">
                                 <span class="stat-label">CPU</span>
                                 <div class="stat-bar"><div class="stat-bar-fill" style="width: ${s.cpu}%; background: ${getBarColor(s.cpu)}"></div></div>
@@ -4783,18 +6577,8 @@ HTML_PAGE = '''<!DOCTYPE html>
                         </div>
                     ` : ''}
                     ${containersListHtml}
-                    <div class="device-edit" onclick="editDevice('${dev.id}')">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path>
-                            <path d="m15 5 4 4"></path>
-                        </svg>
-                    </div>
-                    ${!isHost ? `<div class="device-delete" onclick="deleteDevice('${dev.id}')">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <line x1="20" y1="4" x2="4" y2="20"></line>
-                            <line x1="4" y1="4" x2="20" y2="20"></line>
-                        </svg>
-                    </div>` : ''}
+                    <div class="device-edit" onclick="editDevice('${dev.id}')">${ICON_EDIT}</div>
+                    ${!isHost ? `<div class="device-delete" onclick="deleteDevice('${dev.id}')">${ICON_DELETE}</div>` : ''}
                 </div>
                 `;
             }).join('');
@@ -4809,7 +6593,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             const currentState = config.settings.accordion[deviceId] !== false;
             config.settings.accordion[deviceId] = !currentState;
 
-            // Update UI immediately
+            // Update UI
             const card = document.querySelector(`.device-card[data-id="${deviceId}"]`);
             if (card) {
                 const summary = card.querySelector('.containers-summary');
@@ -4877,13 +6661,32 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
         
         async function doShutdown(id) {
-            if (!confirm('Shutdown this device?')) return;
+            const dev = config.devices.find(d => d.id === id);
+            const isHost = dev?.is_host;
+            const msg = isHost ? 'This will SHUTDOWN the host server running DeQ. Continue?' : 'Shutdown this device?';
+            if (!confirm(msg)) return;
             const res = await api(`device/${id}/shutdown`);
             if (res.success) {
                 toast('Shutdown command sent');
                 setTimeout(loadDeviceStatus, 5000);
             } else {
                 toast(res.error || 'Failed', 'error');
+            }
+        }
+
+        async function doSuspend(id) {
+            const dev = config.devices.find(d => d.id === id);
+            const isHost = dev?.is_host;
+            const msg = isHost ? 'This will SUSPEND the host server running DeQ. Continue?' : 'Suspend this device?';
+            if (!confirm(msg)) return;
+            const res = await api(`device/${id}/suspend`);
+            if (res.success) {
+                toast(res.warning || 'Suspend command sent');
+                setTimeout(loadDeviceStatus, 5000);
+            } else {
+                let msg = res.error || 'Failed';
+                if (res.available) msg += ` (available: ${res.available})`;
+                toast(msg, 'error');
             }
         }
         
@@ -4951,13 +6754,18 @@ HTML_PAGE = '''<!DOCTYPE html>
             await api('config', 'POST', config);
         }
 
+        async function logout() {
+            await fetch('/auth/logout', {method: 'POST'});
+            window.location.reload();
+        }
+
         async function saveLink(e) {
             e.preventDefault();
             const id = document.getElementById('link-id').value || generateUUID();
-            const note = document.getElementById('link-note').value.trim();
+            const note = document.getElementById('card-note').value.trim();
             const link = {
                 id,
-                name: document.getElementById('link-name').value,
+                name: document.getElementById('card-name').value,
                 url: document.getElementById('link-url').value,
                 icon: document.getElementById('link-icon').value || 'link',
                 order: config.links.length
@@ -4971,14 +6779,16 @@ HTML_PAGE = '''<!DOCTYPE html>
             await api('config', 'POST', config);
             closeModal('link-modal');
             renderLinks();
+            applySectionVisibility();
             toast('Link saved');
         }
-        
+
         async function deleteLink(id) {
             if (!confirm('Delete this link?')) return;
             config.links = config.links.filter(l => l.id !== id);
             await api('config', 'POST', config);
             renderLinks();
+            applySectionVisibility();
             toast('Link deleted');
         }
         
@@ -5054,10 +6864,10 @@ HTML_PAGE = '''<!DOCTYPE html>
         function openLinkModal(link = null) {
             document.getElementById('link-modal-title').textContent = link ? 'Edit Link' : 'Add Link';
             document.getElementById('link-id').value = link?.id || '';
-            document.getElementById('link-name').value = link?.name || '';
+            document.getElementById('card-name').value = link?.name || '';
             document.getElementById('link-url').value = link?.url || '';
             document.getElementById('link-icon').value = link?.icon || '';
-            document.getElementById('link-note').value = link?.note || '';
+            document.getElementById('card-note').value = link?.note || '';
             openModal('link-modal');
         }
         
@@ -5353,7 +7163,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 }
             });
             if (errors.length > 0) {
-                showToast('Missing threshold for: ' + errors.join(', '), true);
+                toast('Missing threshold for: ' + errors.join(', '), 'error');
                 return;
             }
 
@@ -5402,7 +7212,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             device.alerts = alerts;
             await api('config', 'POST', { config });
             closeModal('stats-modal');
-            showToast('Alert settings saved');
+            toast('Alert settings saved');
         }
 
         function getThresholdValue(key) {
@@ -5444,10 +7254,12 @@ HTML_PAGE = '''<!DOCTYPE html>
 
                 const scheduleText = formatSchedule(task.schedule);
                 const typeIcon = task.type === 'backup' ? 'folder-sync' :
-                                 task.type === 'shutdown' ? 'power-off' : 'power';
+                                 task.type === 'shutdown' ? 'power-off' :
+                                 task.type === 'suspend' ? 'moon' :
+                                 task.type === 'script' ? 'terminal' : 'power';
 
                 return `
-                <div class="task-card ${isRunning ? 'running' : ''}" data-id="${task.id}">
+                <div class="task-card ${isRunning ? 'running' : ''}" data-id="${task.id}" draggable="true" ondragstart="taskDragStart(event)" ondragover="taskDragOver(event)" ondragleave="taskDragLeave(event)" ondrop="taskDrop(event)" ondragend="taskDragEnd(event)">
                     <div class="task-header">
                         <div class="task-icon">${getIcon(typeIcon)}</div>
                         <span class="task-name">${task.name}</span>
@@ -5466,17 +7278,8 @@ HTML_PAGE = '''<!DOCTYPE html>
                             ${isRunning ? 'Running...' : '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Run Now'}
                         </button>
                     </div>
-                    <div class="task-edit" onclick="editTask('${task.id}')">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path>
-                        </svg>
-                    </div>
-                    <div class="task-delete" onclick="deleteTask('${task.id}')">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <line x1="20" y1="4" x2="4" y2="20"></line>
-                            <line x1="4" y1="4" x2="20" y2="20"></line>
-                        </svg>
-                    </div>
+                    <div class="task-edit" onclick="editTask('${task.id}')">${ICON_EDIT}</div>
+                    <div class="task-delete" onclick="deleteTask('${task.id}')">${ICON_DELETE}</div>
                 </div>
                 `;
             }).join('');
@@ -5727,21 +7530,22 @@ HTML_PAGE = '''<!DOCTYPE html>
             activePane: 'left',
             busy: false
         };
+        let fmClickTimer = null;
+        let fmClickPane = null;
+        let fmClickIdx = null;
 
         function openFileManager() {
-            // Populate device dropdowns (devices with SSH or host)
             const sshDevices = config.devices.filter(d => d.ssh?.user || d.is_host);
             const options = sshDevices.map(d => `<option value="${d.id}">${d.name}</option>`).join('');
+            const leftSelect = document.getElementById('fm-left-device');
+            const rightSelect = document.getElementById('fm-right-device');
 
-            document.getElementById('fm-left-device').innerHTML = options;
-            document.getElementById('fm-right-device').innerHTML = options;
+            leftSelect.innerHTML = rightSelect.innerHTML = options;
 
-            // Set different defaults if possible
-            if (sshDevices.length > 1) {
-                document.getElementById('fm-right-device').selectedIndex = 1;
-            }
+            if (config.fm_left_device && sshDevices.some(d => d.id === config.fm_left_device)) leftSelect.value = config.fm_left_device;
+            if (config.fm_right_device && sshDevices.some(d => d.id === config.fm_right_device)) rightSelect.value = config.fm_right_device;
+            else if (sshDevices.length > 1) rightSelect.selectedIndex = 1;
 
-            // Reset state
             fmState.left = { device: null, path: '/', files: [], selected: new Set() };
             fmState.right = { device: null, path: '/', files: [], selected: new Set() };
             fmState.busy = false;
@@ -5750,8 +7554,6 @@ HTML_PAGE = '''<!DOCTYPE html>
             fmSetActivePane('left');
             refreshIcons();
             fmSetupDragDrop();
-
-            // Load files for both panes
             fmLoadFiles('left');
             fmLoadFiles('right');
         }
@@ -5762,6 +7564,13 @@ HTML_PAGE = '''<!DOCTYPE html>
             const listEl = document.getElementById(`fm-${pane}-list`);
             const pathEl = document.getElementById(`fm-${pane}-path`);
 
+            const previousPath = state.path;
+            const deviceChanged = state.device !== deviceId;
+
+            if (deviceChanged) {
+                const dev = config.devices.find(d => d.id === deviceId);
+                state.path = dev?.last_fm_path || '/';
+            }
             state.device = deviceId;
             state.selected.clear();
 
@@ -5770,17 +7579,27 @@ HTML_PAGE = '''<!DOCTYPE html>
 
             try {
                 const res = await api(`device/${deviceId}/files?path=${encodeURIComponent(state.path)}`);
-                if (res.success) {
-                    state.files = res.files;
-                    fmRenderList(pane);
-                    fmUpdateStorage(pane, res.storage);
-                } else {
-                    listEl.innerHTML = `<div class="fm-error">${res.error}</div>`;
-                    fmUpdateStorage(pane, null);
-                }
+                if (!res.success) throw new Error(res.error || 'Failed to open directory');
+
+                state.files = res.files;
+                fmRenderList(pane);
+                fmUpdateStorage(pane, res.storage);
+
+                const configKey = pane === 'left' ? 'fm_left_device' : 'fm_right_device';
+                const dev = config.devices.find(d => d.id === deviceId);
+                let changed = false;
+                if (config[configKey] !== deviceId) { config[configKey] = deviceId; changed = true; }
+                if (dev && dev.last_fm_path !== state.path) { dev.last_fm_path = state.path; changed = true; }
+                if (changed) saveConfig();
             } catch (e) {
-                listEl.innerHTML = '<div class="fm-error">Failed to load</div>';
-                fmUpdateStorage(pane, null);
+                if (deviceChanged && state.path !== '/') {
+                    state.path = '/';
+                    return fmLoadFiles(pane);
+                }
+                toast(e.message || 'Failed to load directory', 'error');
+                state.path = previousPath;
+                state.files.length > 0 ? fmRenderList(pane) : listEl.innerHTML = '';
+                pathEl.textContent = state.path;
             }
 
             fmUpdateButtons();
@@ -5815,8 +7634,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 const date = fmFormatDate(f.mtime);
 
                 html += `<div class="fm-item${isSelected ? ' selected' : ''}" draggable="false"
-                    onclick="fmSelect('${pane}', ${idx})"
-                    ondblclick="fmDblClick('${pane}', ${idx})">
+                    onclick="fmClick('${pane}', ${idx})">
                     <svg class="fm-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${icon}</svg>
                     <span class="fm-name">${fmEscape(f.name)}</span>
                     <span class="fm-size">${size}</span>
@@ -5848,12 +7666,30 @@ HTML_PAGE = '''<!DOCTYPE html>
                 if (file) {
                     const fullPath = state.path === '/' ? `/${file.name}` : `${state.path}/${file.name}`;
                     pathEl.textContent = fullPath;
+                    pathEl.title = fullPath;
                     return;
                 }
             }
 
             // Otherwise show just the directory path
             pathEl.textContent = state.path;
+            pathEl.title = state.path;
+        }
+
+        function fmClick(pane, idx) {
+            if (fmClickTimer && fmClickPane === pane && fmClickIdx === idx) {
+                clearTimeout(fmClickTimer);
+                fmClickTimer = null;
+                fmDblClick(pane, idx);
+            } else {
+                if (fmClickTimer) clearTimeout(fmClickTimer);
+                fmClickPane = pane;
+                fmClickIdx = idx;
+                fmClickTimer = setTimeout(() => {
+                    fmClickTimer = null;
+                    fmSelect(pane, idx);
+                }, 250);
+            }
         }
 
         function fmSelect(pane, idx) {
@@ -5909,11 +7745,9 @@ HTML_PAGE = '''<!DOCTYPE html>
             const rightSel = fmState.right.selected.size;
             const totalSel = leftSel + rightSel;
 
-            // Copy/Move: need selection on source side
-            document.getElementById('fm-copy-right').disabled = leftSel === 0 || fmState.busy;
-            document.getElementById('fm-copy-left').disabled = rightSel === 0 || fmState.busy;
-            document.getElementById('fm-move-right').disabled = leftSel === 0 || fmState.busy;
-            document.getElementById('fm-move-left').disabled = rightSel === 0 || fmState.busy;
+            // Copy/Move: need selection
+            document.getElementById('fm-copy').disabled = totalSel === 0 || fmState.busy;
+            document.getElementById('fm-move').disabled = totalSel === 0 || fmState.busy;
 
             // New Folder: always enabled if not busy and pane is active
             document.getElementById('fm-newfolder').disabled = !fmState.activePane || fmState.busy;
@@ -5924,6 +7758,19 @@ HTML_PAGE = '''<!DOCTYPE html>
             // Delete/Zip: at least one selection
             document.getElementById('fm-delete').disabled = totalSel === 0 || fmState.busy;
             document.getElementById('fm-zip').disabled = totalSel === 0 || fmState.busy;
+
+            // Extract: one archive file
+            let canExtract = false;
+            if (totalSel === 1) {
+                const pane = leftSel === 1 ? 'left' : 'right';
+                const idx = Array.from(fmState[pane].selected)[0];
+                const file = fmState[pane].files[idx];
+                if (file && !file.is_dir) {
+                    const n = file.name.toLowerCase();
+                    canExtract = n.endsWith('.zip') || n.endsWith('.tar') || n.endsWith('.tar.gz') || n.endsWith('.tgz') || n.endsWith('.tar.bz2') || n.endsWith('.tbz2') || n.endsWith('.tar.xz') || n.endsWith('.txz');
+                }
+            }
+            document.getElementById('fm-extract').disabled = !canExtract || fmState.busy;
 
             // Download: one file (not folder)
             let canDownload = false;
@@ -5936,12 +7783,14 @@ HTML_PAGE = '''<!DOCTYPE html>
             document.getElementById('fm-download').disabled = !canDownload || fmState.busy;
         }
 
-        async function fmCopy(fromPane, toPane) {
-            await fmTransfer('copy', fromPane, toPane);
+        async function fmCopy() {
+            const from = fmState.left.selected.size > 0 ? 'left' : 'right';
+            await fmTransfer('copy', from, from === 'left' ? 'right' : 'left');
         }
 
-        async function fmMove(fromPane, toPane) {
-            await fmTransfer('move', fromPane, toPane);
+        async function fmMove() {
+            const from = fmState.left.selected.size > 0 ? 'left' : 'right';
+            await fmTransfer('move', from, from === 'left' ? 'right' : 'left');
         }
 
         async function fmTransfer(operation, fromPane, toPane) {
@@ -5955,38 +7804,84 @@ HTML_PAGE = '''<!DOCTYPE html>
 
             if (paths.length === 0) return;
 
-            // Only confirm for move (destructive), not for copy
-            if (operation === 'move') {
-                const msg = `Move ${paths.length} item(s)?`;
-                if (!confirm(msg)) return;
-            }
-
             fmState.busy = true;
             fmUpdateButtons();
-            toast(`${operation === 'copy' ? 'Copying' : 'Moving'}...`);
 
-            try {
-                const res = await api(`device/${fromState.device}/files`, 'POST', {
-                    operation,
-                    paths,
-                    dest_device: toState.device,
-                    dest_path: toState.path
-                });
+            // 1. Preflight check
+            const preflight = await api(`device/${fromState.device}/files`, 'POST', {
+                operation: 'preflight',
+                paths,
+                dest_device: toState.device,
+                dest_path: toState.path
+            });
 
-                if (res.success) {
-                    toast(`${operation === 'copy' ? 'Copied' : 'Moved'} successfully`);
-                    fromState.selected.clear();
-                    fmLoadFiles(fromPane);
-                    fmLoadFiles(toPane);
-                } else {
-                    toast(res.error || 'Operation failed', 'error');
-                }
-            } catch (e) {
-                toast('Operation failed', 'error');
+            if (!preflight.ok) {
+                toast(preflight.error, 'error');
+                fmState.busy = false;
+                fmUpdateButtons();
+                return;
             }
 
-            fmState.busy = false;
-            fmUpdateButtons();
+            // 2. Confirm for large transfers (>100MB) or move
+            const sizeStr = fmFormatSize(preflight.src_size);
+            let confirmMsg = operation === 'move' ? `Move ${sizeStr}?` : `Copy ${sizeStr}?`;
+            if (preflight.needs_host_transfer) confirmMsg += ' (via host)';
+
+            if (preflight.src_size > 100 * 1024 * 1024 || operation === 'move') {
+                if (!confirm(confirmMsg)) {
+                    fmState.busy = false;
+                    fmUpdateButtons();
+                    return;
+                }
+            }
+
+            // 3. Start transfer
+            const start = await api(`device/${fromState.device}/files`, 'POST', {
+                operation,
+                paths,
+                dest_device: toState.device,
+                dest_path: toState.path
+            });
+
+            if (!start.job_id) {
+                toast(start.error || 'Transfer failed', 'error');
+                fmState.busy = false;
+                fmUpdateButtons();
+                return;
+            }
+
+            // 4. Poll job
+            fmPollJob(start.job_id, operation === 'move' ? 'Moving' : 'Copying', () => {
+                toast(operation === 'move' ? 'Moved successfully' : 'Copied successfully');
+                fromState.selected.clear();
+                fmLoadFiles(fromPane);
+                fmLoadFiles(toPane);
+            });
+        }
+
+        function fmPollJob(jobId, action, onComplete) {
+            const progressEl = document.getElementById('fm-progress');
+            const progressFill = document.getElementById('fm-progress-fill');
+            const progressText = document.getElementById('fm-progress-text');
+            progressEl.classList.add('visible');
+            progressFill.style.width = '0%';
+
+            const poll = setInterval(async () => {
+                const s = await api(`job/${jobId}`);
+                if (s.status === 'running') {
+                    const phase = s.phases > 1 ? `Phase ${s.phase}/${s.phases}: ` : '';
+                    const speed = s.speed ? ` (${s.speed})` : '';
+                    progressFill.style.width = s.progress + '%';
+                    progressText.textContent = `${phase}${action}... ${s.progress}%${speed}`;
+                } else {
+                    clearInterval(poll);
+                    progressEl.classList.remove('visible');
+                    fmState.busy = false;
+                    fmUpdateButtons();
+                    if (s.status === 'complete') onComplete();
+                    else toast(s.error || 'Transfer failed', 'error');
+                }
+            }, 1000);
         }
 
         async function fmRename() {
@@ -6159,6 +8054,55 @@ HTML_PAGE = '''<!DOCTYPE html>
 
             fmState.busy = false;
             fmUpdateButtons();
+        }
+
+        async function fmExtract() {
+            const srcPane = fmState.left.selected.size > 0 ? 'left' : 'right';
+            const destPane = srcPane === 'left' ? 'right' : 'left';
+            const srcState = fmState[srcPane];
+            const destState = fmState[destPane];
+
+            const idx = Array.from(srcState.selected)[0];
+            const file = srcState.files[idx];
+            const archivePath = srcState.path === '/' ? `/${file.name}` : `${srcState.path}/${file.name}`;
+
+            fmState.busy = true;
+            fmUpdateButtons();
+            toast('Extracting...');
+
+            try {
+                const res = await api(`device/${srcState.device}/files`, 'POST', {
+                    operation: 'extract',
+                    paths: [archivePath],
+                    dest_device: destState.device,
+                    dest_path: destState.path
+                });
+
+                if (!res.success) {
+                    toast(res.error || 'Extract failed', 'error');
+                    fmState.busy = false;
+                    fmUpdateButtons();
+                    return;
+                }
+
+                if (res.transfer && res.job_id) {
+                    fmPollJob(res.job_id, 'Extracting', () => {
+                        toast('Extracted');
+                        srcState.selected.clear();
+                        fmLoadFiles(destPane);
+                    });
+                } else {
+                    toast('Extracted');
+                    srcState.selected.clear();
+                    fmLoadFiles(destPane);
+                    fmState.busy = false;
+                    fmUpdateButtons();
+                }
+            } catch (e) {
+                toast('Extract failed', 'error');
+                fmState.busy = false;
+                fmUpdateButtons();
+            }
         }
 
         function fmDownload() {
@@ -6366,36 +8310,30 @@ HTML_PAGE = '''<!DOCTYPE html>
             const target = getWizardTarget();
 
             if (wizardStep === 1) {
-                if (action === 'backup') {
-                    // Backup: skip step 2, go to schedule
-                    showWizardStep(3);
-                } else {
-                    // Wake/Shutdown: show target type selection
-                    document.getElementById('step2-action').textContent = action;
-                    if (action === 'wake') {
-                        document.getElementById('step2-device-desc').textContent = 'Wake via Wake-on-LAN';
-                        document.getElementById('step2-docker-desc').textContent = 'Start a container';
-                    } else {
-                        document.getElementById('step2-device-desc').textContent = 'Shutdown via SSH';
-                        document.getElementById('step2-docker-desc').textContent = 'Stop a container';
-                    }
+                if (action === 'wake') {
+                    document.getElementById('step2-action').textContent = 'power on';
+                    document.getElementById('step2-device-desc').textContent = 'Wake via Wake-on-LAN';
+                    document.getElementById('step2-docker-desc').textContent = 'Start container';
                     showWizardStep(2);
+                } else if (action === 'shutdown') {
+                    document.getElementById('step2-action').textContent = 'power off';
+                    document.getElementById('step2-device-desc').textContent = 'Shutdown via SSH';
+                    document.getElementById('step2-docker-desc').textContent = 'Stop container';
+                    showWizardStep(2);
+                } else if (action === 'suspend') {
+                    showWizardStep(3);
+                } else if (action === 'backup') {
+                    showWizardStep(3);
+                } else if (action === 'script') {
+                    showWizardStep(3);
                 }
             } else if (wizardStep === 2) {
-                // After target type, go to schedule
                 showWizardStep(3);
             } else if (wizardStep === 3) {
-                // After schedule
-                if (action === 'backup') {
-                    // Backup: go to source, start browsing
-                    showWizardStep(5);
-                    browseFolder('source');
-                } else {
-                    // Wake/Shutdown: go to target selection
+                if (action === 'wake' || action === 'shutdown') {
                     if (target === 'device') {
                         document.getElementById('target-device-group').style.display = 'block';
                         document.getElementById('target-container-group').style.display = 'none';
-                        // Filter devices based on action
                         const devices = action === 'wake'
                             ? config.devices.filter(d => d.wol?.mac)
                             : config.devices.filter(d => d.ssh?.user || d.is_host);
@@ -6406,19 +8344,48 @@ HTML_PAGE = '''<!DOCTYPE html>
                         document.getElementById('target-container-group').style.display = 'block';
                     }
                     showWizardStep(4);
+                } else if (action === 'suspend') {
+                    document.getElementById('target-device-group').style.display = 'block';
+                    document.getElementById('target-container-group').style.display = 'none';
+                    const devices = config.devices.filter(d => d.ssh?.user || d.is_host);
+                    const options = devices.map(d => `<option value="${d.id}">${d.name}</option>`).join('');
+                    document.getElementById('task-target-device').innerHTML = options || '<option value="">No devices available</option>';
+                    showWizardStep(4);
+                } else if (action === 'backup') {
+                    showWizardStep(5);
+                    browseFolder('source');
+                } else if (action === 'script') {
+                    populateScriptSelect();
+                    showWizardStep(8);
                 }
             } else if (wizardStep === 4) {
-                // Wake/Shutdown: go to options
                 document.getElementById('backup-options').style.display = 'none';
                 showWizardStep(7);
             } else if (wizardStep === 5) {
-                // Backup source: go to destination, start browsing
                 showWizardStep(6);
                 browseFolder('dest');
             } else if (wizardStep === 6) {
-                // Backup destination: go to options
                 document.getElementById('backup-options').style.display = 'block';
                 showWizardStep(7);
+            } else if (wizardStep === 8) {
+                document.getElementById('backup-options').style.display = 'none';
+                showWizardStep(7);
+            }
+        }
+
+        async function populateScriptSelect() {
+            const select = document.getElementById('task-script');
+            select.innerHTML = '<option value="">Loading...</option>';
+            try {
+                const res = await api('scripts/scan');
+                const scripts = res.scripts || [];
+                if (scripts.length === 0) {
+                    select.innerHTML = '<option value="">No scripts found</option>';
+                } else {
+                    select.innerHTML = scripts.map(s => `<option value="${s.path}">${s.path}</option>`).join('');
+                }
+            } catch (e) {
+                select.innerHTML = '<option value="">Failed to load scripts</option>';
             }
         }
 
@@ -6428,10 +8395,10 @@ HTML_PAGE = '''<!DOCTYPE html>
             if (wizardStep === 2) {
                 showWizardStep(1);
             } else if (wizardStep === 3) {
-                if (action === 'backup') {
-                    showWizardStep(1);
-                } else {
+                if (action === 'wake' || action === 'shutdown') {
                     showWizardStep(2);
+                } else {
+                    showWizardStep(1);
                 }
             } else if (wizardStep === 4) {
                 showWizardStep(3);
@@ -6442,9 +8409,13 @@ HTML_PAGE = '''<!DOCTYPE html>
             } else if (wizardStep === 7) {
                 if (action === 'backup') {
                     showWizardStep(6);
+                } else if (action === 'script') {
+                    showWizardStep(8);
                 } else {
                     showWizardStep(4);
                 }
+            } else if (wizardStep === 8) {
+                showWizardStep(3);
             }
         }
 
@@ -6493,6 +8464,10 @@ HTML_PAGE = '''<!DOCTYPE html>
                 task.options = {
                     delete: document.getElementById('task-delete-files').checked
                 };
+            } else if (action === 'script') {
+                task.script = document.getElementById('task-script').value;
+            } else if (action === 'suspend') {
+                task.device = document.getElementById('task-target-device').value;
             } else if (target === 'device') {
                 task.device = document.getElementById('task-target-device').value;
             } else if (target === 'docker') {
@@ -6580,7 +8555,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             setTimeout(pollStatus, 1000);
         }
 
-        function editTask(id) {
+        async function editTask(id) {
             const task = config.tasks.find(t => t.id === id);
             if (!task) return;
 
@@ -6608,6 +8583,9 @@ HTML_PAGE = '''<!DOCTYPE html>
                 document.getElementById('task-dest-device').value = task.dest?.device || '';
                 document.getElementById('task-dest-path').value = task.dest?.path || '';
                 document.getElementById('task-delete-files').checked = task.options?.delete || false;
+            } else if (task.type === 'script') {
+                await populateScriptSelect();
+                document.getElementById('task-script').value = task.script || '';
             } else if (target === 'device') {
                 // Wake/Shutdown device - use new field or fall back to old structure
                 const deviceId = task.device || task.source?.device || '';
@@ -6629,10 +8607,12 @@ HTML_PAGE = '''<!DOCTYPE html>
             if (res.success) {
                 config = res.config;
                 runningTasks = res.running_tasks || [];
+                if (res.auth_enabled) document.getElementById('logout-btn').style.display = '';
                 applySectionVisibility();
                 applyMonochrome();
                 initTheme();
                 renderLinks();
+                renderQuickActions();
                 renderDevices();
                 renderTasks();
             }
@@ -6659,6 +8639,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             editMode = !editMode;
             document.body.classList.toggle('edit-mode', editMode);
             document.getElementById('edit-toggle').classList.toggle('active', editMode);
+            applySectionVisibility();
         };
         
         document.getElementById('add-link').onclick = () => openLinkModal();
@@ -6677,8 +8658,12 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         function startPolling() {
             loadDeviceStatus();
+            renderTasks();
             if (!deviceInterval) {
-                deviceInterval = setInterval(loadDeviceStatus, 10000);
+                deviceInterval = setInterval(() => {
+                    loadDeviceStatus();
+                    renderTasks();
+                }, 5000);
             }
         }
 
@@ -6914,6 +8899,12 @@ HTML_PAGE = '''<!DOCTYPE html>
             }
         }
 
+        // Initialize icons
+        document.getElementById('header-logo').innerHTML = LOGO_SVG;
+        document.getElementById('onboarding-logo').innerHTML = LOGO_SVG;
+        document.querySelectorAll('.modal-close').forEach(el => el.innerHTML = ICON_CLOSE);
+        document.querySelectorAll('.icon-plus').forEach(el => el.innerHTML = ICON_PLUS);
+
         // Load everything
         loadConfig().then(() => {
             if (NEEDS_ONBOARDING) {
@@ -6926,22 +8917,24 @@ HTML_PAGE = '''<!DOCTYPE html>
 </html>'''
 
 # PWA Manifest
-MANIFEST_JSON = json.dumps({
-    "name": "DeQ",
-    "short_name": "DeQ",
-    "description": "Homelab Dashboard",
-    "start_url": "/",
-    "display": "standalone",
-    "background_color": "#0a0a0a",
-    "theme_color": "#0a0a0a",
-    "orientation": "any",
-    "icons": [
-        {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
-    ]
-})
+def get_manifest_json():
+    return json.dumps({
+        "name": "DeQ",
+        "short_name": "DeQ",
+        "description": "Homelab Dashboard",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0a0a0a",
+        "theme_color": "#0a0a0a",
+        "orientation": "any",
+        "icons": [
+            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}
+        ]
+    })
 
 # Icon
-ICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+def get_icon_svg():
+    return '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <rect width="512" height="512" fill="#0a0a0a"/>
   <!-- D -->
   <path d="M80 80 L210 80 Q230 80 230 100 L230 412 Q230 432 210 432 L80 432 Z" fill="none" stroke="#e0e0e0" stroke-width="16"/>
@@ -6952,839 +8945,6 @@ ICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <path d="M432 380 L432 302 Q432 282 412 282 L302 282 Q282 282 282 302 L282 412 Q282 432 302 432 L380 432" fill="none" stroke="#2ed573" stroke-width="16" stroke-linecap="round"/>
   <line x1="405" y1="405" x2="435" y2="435" stroke="#2ed573" stroke-width="16" stroke-linecap="round"/>
 </svg>'''
-
-# === TASK EXECUTION ===
-def log_task(task_id, message):
-    """Append a log line to the task's log file."""
-    log_file = f"{TASK_LOGS_DIR}/{task_id}.log"
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(log_file, 'a') as f:
-        f.write(f"[{timestamp}] {message}\n")
-
-# Track running tasks
-running_tasks = {}
-
-def run_task_async(task_id):
-    """Execute a task in a background thread."""
-    global CONFIG, running_tasks
-
-    task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
-    if not task:
-        return
-
-    task_type = task.get('type', 'backup')
-    log_task(task_id, f"Starting {task_type} task: {task.get('name', 'unnamed')}")
-
-    try:
-        if task_type == 'backup':
-            result = run_backup_task(task)
-        elif task_type == 'wake':
-            result = run_wake_task(task)
-        elif task_type == 'shutdown':
-            result = run_shutdown_task(task)
-        else:
-            result = {"success": False, "error": f"Unknown task type: {task_type}"}
-
-        # Update task status
-        task['last_run'] = datetime.now().isoformat()
-        if result.get('success'):
-            task['last_status'] = 'success'
-            task['last_error'] = None
-            if 'size' in result:
-                task['last_size'] = result['size']
-            log_task(task_id, f"Completed successfully")
-        elif result.get('skipped'):
-            task['last_status'] = 'skipped'
-            task['last_error'] = result.get('error', 'source offline')
-            log_task(task_id, f"Skipped: {task['last_error']}")
-        else:
-            task['last_status'] = 'failed'
-            task['last_error'] = result.get('error', 'unknown error')
-            log_task(task_id, f"Failed: {task['last_error']}")
-
-        save_config(CONFIG)
-
-    except Exception as e:
-        task['last_run'] = datetime.now().isoformat()
-        task['last_status'] = 'failed'
-        task['last_error'] = str(e)
-        save_config(CONFIG)
-        log_task(task_id, f"Exception: {e}")
-
-    finally:
-        running_tasks.pop(task_id, None)
-
-
-def run_task(task_id):
-    """Start a task in background thread, return immediately."""
-    global CONFIG, running_tasks
-
-    task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
-    if not task:
-        return {"success": False, "error": "Task not found"}
-
-    if task_id in running_tasks:
-        return {"success": False, "error": "Task already running"}
-
-    # Start in background thread
-    running_tasks[task_id] = True
-    thread = threading.Thread(target=run_task_async, args=(task_id,), daemon=True)
-    thread.start()
-
-    return {"success": True, "started": True}
-
-def run_backup_task(task):
-    """Execute a backup task using rsync."""
-    source = task.get('source', {})
-    dest = task.get('dest', {})
-    options = task.get('options', {})
-
-    source_device = next((d for d in CONFIG['devices'] if d['id'] == source.get('device')), None)
-    dest_device = next((d for d in CONFIG['devices'] if d['id'] == dest.get('device')), None)
-
-    if not source_device or not dest_device:
-        return {"success": False, "error": "Source or destination device not found"}
-
-    source_path = source.get('path', '')
-    dest_path = dest.get('path', '')
-
-    if not source_path or not dest_path:
-        return {"success": False, "error": "Source or destination path not specified"}
-
-    # Check if source device is online
-    source_is_host = source_device.get('is_host', False)
-    if not source_is_host:
-        if not ping_host(source_device['ip']):
-            return {"success": False, "skipped": True, "error": "source offline"}
-
-    # Build rsync command
-    rsync_opts = ["-avz", "--stats"]
-    if options.get('delete'):
-        rsync_opts.append("--delete")
-
-    # Source path - respect user's trailing slash choice
-    if source_is_host:
-        rsync_source = source_path
-    else:
-        ssh_user = source_device.get('ssh', {}).get('user', 'root')
-        ssh_port = source_device.get('ssh', {}).get('port', 22)
-        rsync_opts.extend(["-e", f"ssh -p {ssh_port} -o StrictHostKeyChecking=no -o ConnectTimeout=10"])
-        rsync_source = f"{ssh_user}@{source_device['ip']}:{source_path}"
-
-    # Destination path - respect user's trailing slash choice
-    dest_is_host = dest_device.get('is_host', False)
-    if dest_is_host:
-        # Ensure destination directory exists
-        os.makedirs(dest_path, exist_ok=True)
-        rsync_dest = dest_path
-    else:
-        ssh_user = dest_device.get('ssh', {}).get('user', 'root')
-        ssh_port = dest_device.get('ssh', {}).get('port', 22)
-        if "-e" not in rsync_opts:
-            rsync_opts.extend(["-e", f"ssh -p {ssh_port} -o StrictHostKeyChecking=no -o ConnectTimeout=10"])
-        rsync_dest = f"{ssh_user}@{dest_device['ip']}:{dest_path}"
-
-    cmd = ["rsync"] + rsync_opts + [rsync_source, rsync_dest]
-    log_task(task['id'], f"Running: {' '.join(cmd)}")
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-
-        if result.returncode == 0:
-            # Parse total size from rsync stats
-            size = ""
-            for line in result.stdout.split('\n'):
-                if 'Total file size' in line and 'transferred' not in line:
-                    parts = line.split(':')
-                    if len(parts) > 1:
-                        size = parts[1].strip().split()[0]
-                        # Convert to human readable
-                        try:
-                            # Remove thousand separators (comma or dot)
-                            bytes_val = int(size.replace(',', '').replace('.', ''))
-                            if bytes_val >= 1e9:
-                                size = f"{bytes_val/1e9:.1f}GB"
-                            elif bytes_val >= 1e6:
-                                size = f"{bytes_val/1e6:.0f}MB"
-                            else:
-                                size = f"{bytes_val/1e3:.0f}KB"
-                        except:
-                            pass
-            return {"success": True, "size": size}
-        else:
-            return {"success": False, "error": result.stderr[:200] if result.stderr else "rsync failed"}
-
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "timeout (1h)"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def run_wake_task(task):
-    """Execute a wake task - WOL for device, docker start for container."""
-    target = task.get('target', 'device')
-
-    if target == 'docker':
-        container = task.get('container')
-        if not container:
-            return {"success": False, "error": "No container specified"}
-        return docker_action(container, 'start')
-
-    # Device wake (WOL)
-    device_id = task.get('device') or task.get('source', {}).get('device')  # backward compat
-    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
-
-    if not device:
-        return {"success": False, "error": "Device not found"}
-
-    if not device.get('wol', {}).get('mac'):
-        return {"success": False, "error": "Device has no WOL configured"}
-
-    result = send_wol(device['wol']['mac'], device['wol'].get('broadcast', '255.255.255.255'))
-    return result
-
-
-def run_shutdown_task(task):
-    """Execute a shutdown task - SSH shutdown for device, docker stop for container."""
-    target = task.get('target', 'device')
-
-    if target == 'docker':
-        container = task.get('container')
-        if not container:
-            return {"success": False, "error": "No container specified"}
-        return docker_action(container, 'stop')
-
-    # Device shutdown
-    device_id = task.get('device')
-    device = next((d for d in CONFIG['devices'] if d['id'] == device_id), None)
-
-    if not device:
-        return {"success": False, "error": "Device not found"}
-
-    # Host device: local shutdown
-    if device.get('is_host'):
-        try:
-            subprocess.Popen(["sudo", "shutdown", "-h", "now"])
-            return {"success": True}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    # Remote device: SSH shutdown
-    if not device.get('ssh', {}).get('user'):
-        return {"success": False, "error": "Device has no SSH configured"}
-
-    result = ssh_shutdown(device['ip'], device['ssh']['user'], device['ssh'].get('port', 22))
-    return result
-
-
-# === TASK SCHEDULER ===
-def calculate_next_run(task):
-    """Calculate the next run time for a task based on its schedule."""
-    if not task.get('enabled', True):
-        return None
-
-    schedule = task.get('schedule', {})
-    schedule_type = schedule.get('type', 'daily')
-    time_str = schedule.get('time', '03:00')
-
-    try:
-        hour, minute = map(int, time_str.split(':'))
-    except Exception:
-        hour, minute = 3, 0
-
-    now = datetime.now()
-
-    if schedule_type == 'hourly':
-        # Run every hour at specified minute
-        next_run = now.replace(minute=minute, second=0, microsecond=0)
-        if next_run <= now:
-            next_run += timedelta(hours=1)
-
-    elif schedule_type == 'daily':
-        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if next_run <= now:
-            next_run += timedelta(days=1)
-
-    elif schedule_type == 'weekly':
-        day = schedule.get('day', 0)  # 0 = Sunday
-        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        # Convert to Python weekday (0=Monday)
-        py_day = (day - 1) % 7 if day > 0 else 6
-        days_ahead = py_day - now.weekday()
-        if days_ahead < 0 or (days_ahead == 0 and next_run <= now):
-            days_ahead += 7
-        next_run += timedelta(days=days_ahead)
-
-    elif schedule_type == 'monthly':
-        date = schedule.get('date', 1)
-        # Try current month first
-        year, month = now.year, now.month
-        for _ in range(12):  # Try up to 12 months ahead
-            try:
-                next_run = datetime(year, month, date, hour, minute, 0)
-                if next_run > now:
-                    break
-                # Move to next month
-                month += 1
-                if month > 12:
-                    month = 1
-                    year += 1
-            except ValueError:
-                # Invalid day for this month (e.g., Feb 30), try next month
-                month += 1
-                if month > 12:
-                    month = 1
-                    year += 1
-        else:
-            return None  # Could not find valid date
-    else:
-        return None
-
-    return next_run.isoformat()
-
-
-class TaskScheduler:
-    """Background scheduler for automated task execution."""
-
-    def __init__(self):
-        self.running = False
-        self.thread = None
-
-    def start(self):
-        """Start the scheduler thread."""
-        if self.running:
-            return
-        self.running = True
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.thread.start()
-        print("Task scheduler started")
-
-    def stop(self):
-        """Stop the scheduler thread."""
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=5)
-        print("Task scheduler stopped")
-
-    def _run(self):
-        """Main scheduler loop - checks every 60 seconds for due tasks."""
-        # Update next_run times on startup
-        self._update_next_runs()
-
-        while self.running:
-            try:
-                self._check_and_run_tasks()
-            except Exception as e:
-                print(f"Scheduler error: {e}")
-
-            # Sleep for 60 seconds, but check running flag periodically
-            for _ in range(60):
-                if not self.running:
-                    break
-                time.sleep(1)
-
-    def _update_next_runs(self):
-        """Update next_run times for all tasks, preserving valid future times."""
-        global CONFIG
-        changed = False
-        now = datetime.now()
-        for task in CONFIG.get('tasks', []):
-            if task.get('enabled', True):
-                current_next = task.get('next_run')
-                if current_next:
-                    try:
-                        next_dt = datetime.fromisoformat(current_next)
-                        if next_dt > now:
-                            continue
-                    except:
-                        pass
-                next_run = calculate_next_run(task)
-                if next_run != current_next:
-                    task['next_run'] = next_run
-                    changed = True
-        if changed:
-            save_config(CONFIG)
-
-    def _check_and_run_tasks(self):
-        """Check for tasks due to run and execute them."""
-        global CONFIG
-        now = datetime.now()
-
-        for task in CONFIG.get('tasks', []):
-            if not task.get('enabled', True):
-                continue
-
-            next_run_str = task.get('next_run')
-            if not next_run_str:
-                # Calculate and set next_run if missing
-                task['next_run'] = calculate_next_run(task)
-                save_config(CONFIG)
-                continue
-
-            try:
-                next_run = datetime.fromisoformat(next_run_str)
-            except:
-                continue
-
-            if now >= next_run:
-                print(f"Running scheduled task: {task.get('name', task['id'])}")
-                run_task(task['id'])
-
-                # Calculate next run time
-                task['next_run'] = calculate_next_run(task)
-                save_config(CONFIG)
-
-
-# Global scheduler instance
-task_scheduler = TaskScheduler()
-
-
-class RequestHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        print(f"[{self.log_date_time_string()}] {args[0]}")
-    
-    def send_json(self, data, status=200):
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-    
-    def send_html(self, html):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
-        self.end_headers()
-        self.wfile.write(html.encode())
-    
-    def send_file(self, content, content_type, cache=True):
-        self.send_response(200)
-        self.send_header('Content-Type', content_type)
-        if cache:
-            self.send_header('Cache-Control', 'public, max-age=31536000')
-        self.end_headers()
-        if isinstance(content, str):
-            self.wfile.write(content.encode())
-        else:
-            self.wfile.write(content)
-
-    def do_GET(self):
-        path = urlparse(self.path).path
-        query = parse_qs(urlparse(self.path).query)
-        
-        if path == '/' or path == '':
-            needs_onboarding = not CONFIG.get('onboarding_done') and len(CONFIG.get('devices', [])) <= 1
-            html = HTML_PAGE.replace('__NEEDS_ONBOARDING__', 'true' if needs_onboarding else 'false')
-            self.send_html(html)
-            return
-        
-        if path == '/manifest.json':
-            self.send_file(MANIFEST_JSON, 'application/manifest+json')
-            return
-        
-        if path == '/icon.svg':
-            self.send_file(ICON_SVG, 'image/svg+xml')
-            return
-
-        if path.startswith('/fonts/'):
-            font_name = path.split('/')[-1]
-            # Try local fonts dir first (bundled), then DATA_DIR
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            font_paths = [
-                os.path.join(script_dir, 'fonts', font_name),
-                f"{DATA_DIR}/fonts/{font_name}"
-            ]
-            for font_path in font_paths:
-                if os.path.exists(font_path):
-                    with open(font_path, 'rb') as f:
-                        self.send_file(f.read(), 'font/woff2')
-                    return
-            self.send_response(404)
-            self.end_headers()
-            return
-        
-        # API
-        if path.startswith('/api/'):
-            api_path = path[5:].split('?')[0]
-            
-            if api_path == 'config':
-                self.send_json({"success": True, "config": get_config_with_defaults(), "running_tasks": list(running_tasks.keys())})
-                return
-            
-            if api_path == 'stats/host':
-                self.send_json({"success": True, "stats": get_local_stats()})
-                return
-
-            if api_path == 'health':
-                health = get_health_status()
-                self.send_json(health)
-                return
-
-            if api_path == 'version':
-                self.send_json({"version": "0.9.1", "name": "DeQ"})
-                return
-
-            if api_path == 'network/scan':
-                result = scan_network()
-                self.send_json(result)
-                return
-
-            if api_path.startswith('device/'):
-                parts = api_path.split('/')
-                if len(parts) >= 3:
-                    dev_id = parts[1]
-                    action = parts[2]
-                    dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
-                    
-                    if not dev:
-                        self.send_json({"success": False, "error": "Device not found"}, 404)
-                        return
-                    
-                    if action == 'scan-containers':
-                        result = scan_docker_containers(dev)
-                        self.send_json(result)
-                        return
-
-                    if action == 'ssh-check':
-                        ssh_config = dev.get('ssh', {})
-                        if not ssh_config.get('user'):
-                            self.send_json({"success": False, "error": "No SSH user configured"})
-                            return
-                        try:
-                            result = subprocess.run(
-                                ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                                 "-p", str(ssh_config.get('port', 22)), f"{ssh_config['user']}@{dev['ip']}", "echo ok"],
-                                capture_output=True, text=True, timeout=10
-                            )
-                            if result.returncode == 0 and 'ok' in result.stdout:
-                                self.send_json({"success": True})
-                            else:
-                                self.send_json({"success": False, "error": "SSH auth failed"})
-                        except subprocess.TimeoutExpired:
-                            self.send_json({"success": False, "error": "SSH timeout"})
-                        except Exception as e:
-                            self.send_json({"success": False, "error": str(e)})
-                        return
-
-                    if action == 'status':
-                        cached = get_cached_status(dev_id)
-                        refresh_device_status_async(dev)
-                        if cached:
-                            self.send_json({"success": True, **cached})
-                        else:
-                            self.send_json({"success": True, "online": None, "stats": None, "containers": {}})
-                        return
-
-                    if action == 'stats':
-                        if dev.get('is_host'):
-                            stats = get_local_stats()
-                            online = True
-                        else:
-                            online = ping_host(dev.get('ip', ''))
-                            ssh = dev.get('ssh', {})
-                            if online and ssh.get('user'):
-                                stats = get_remote_stats(dev['ip'], ssh['user'], ssh.get('port', 22))
-                            else:
-                                stats = None
-                        self.send_json({"success": True, "stats": stats or {}, "online": online})
-                        return
-
-                    if action == 'wake':
-                        if dev.get('wol', {}).get('mac'):
-                            result = send_wol(dev['wol']['mac'], dev['wol'].get('broadcast', '255.255.255.255'))
-                            self.send_json(result)
-                        else:
-                            self.send_json({"success": False, "error": "WOL not configured"})
-                        return
-                    
-                    if action == 'shutdown':
-                        # Host device: local shutdown
-                        if dev.get('is_host'):
-                            try:
-                                subprocess.Popen(["sudo", "shutdown", "-h", "now"])
-                                self.send_json({"success": True})
-                            except Exception as e:
-                                self.send_json({"success": False, "error": str(e)})
-                            return
-
-                        if dev.get('ssh', {}).get('user'):
-                            result = ssh_shutdown(dev['ip'], dev['ssh']['user'], dev['ssh'].get('port', 22))
-                            self.send_json(result)
-                        else:
-                            self.send_json({"success": False, "error": "SSH not configured"})
-                        return
-                    
-                    # Docker: /api/device/{id}/docker/{container}/{action}
-                    if action == 'docker' and len(parts) >= 5:
-                        container_name = parts[3]
-                        docker_act = parts[4]
-
-                        if not is_valid_container_name(container_name):
-                            self.send_json({"success": False, "error": "Invalid container name"})
-                            return
-
-                        containers = dev.get('docker', {}).get('containers', [])
-                        container_names = [c.get('name') if isinstance(c, dict) else c for c in containers]
-
-                        if container_name not in container_names:
-                            self.send_json({"success": False, "error": f"Container '{container_name}' not configured"})
-                            return
-
-                        if dev.get('is_host'):
-                            result = docker_action(container_name, docker_act)
-                        else:
-                            ssh_config = dev.get('ssh', {})
-                            if ssh_config.get('user'):
-                                result = remote_docker_action(
-                                    dev['ip'],
-                                    ssh_config['user'],
-                                    ssh_config.get('port', 22),
-                                    container_name,
-                                    docker_act
-                                )
-                            else:
-                                result = {"success": False, "error": "SSH not configured"}
-
-                        self.send_json(result)
-                        return
-
-                    # Browse folders: /api/device/{id}/browse?path=/
-                    if action == 'browse':
-                        browse_path = query.get('path', ['/'])[0]
-                        result = browse_folder(dev, browse_path)
-                        self.send_json(result)
-                        return
-
-                    # List files: /api/device/{id}/files?path=/
-                    if action == 'files':
-                        file_path = query.get('path', ['/'])[0]
-                        result = list_files(dev, file_path)
-                        self.send_json(result)
-                        return
-
-                    # Download file: /api/device/{id}/download?path=/file.txt
-                    if action == 'download':
-                        file_path = query.get('path', [''])[0]
-                        if not file_path:
-                            self.send_json({"success": False, "error": "Path required"}, 400)
-                            return
-                        content, filename, error = get_file_for_download(dev, file_path)
-                        if error:
-                            self.send_json({"success": False, "error": error}, 400)
-                            return
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'application/octet-stream')
-                        self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
-                        self.send_header('Content-Length', len(content))
-                        self.end_headers()
-                        self.wfile.write(content)
-                        return
-
-            # Task status (check if running)
-            if api_path.startswith('task/') and api_path.endswith('/status'):
-                task_id = api_path.split('/')[1]
-                is_running = task_id in running_tasks
-                task = next((t for t in CONFIG.get('tasks', []) if t['id'] == task_id), None)
-                if task:
-                    self.send_json({
-                        "success": True,
-                        "running": is_running,
-                        "last_status": task.get('last_status'),
-                        "last_error": task.get('last_error'),
-                        "last_size": task.get('last_size')
-                    })
-                else:
-                    self.send_json({"success": False, "error": "Task not found"}, 404)
-                return
-
-            self.send_json({"success": False, "error": "Not found"}, 404)
-            return
-
-        self.send_response(404)
-        self.end_headers()
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-
-        if path == '/api/config':
-            length = int(self.headers.get('Content-Length', 0))
-            data = json.loads(self.rfile.read(length))
-            global CONFIG
-            CONFIG = data
-            # Update next_run for all enabled tasks
-            for task in CONFIG.get('tasks', []):
-                if task.get('enabled', True):
-                    task['next_run'] = calculate_next_run(task)
-            save_config(CONFIG)
-            self.send_json({"success": True})
-            return
-
-        if path == '/api/onboarding/complete':
-            CONFIG['onboarding_done'] = True
-            save_config(CONFIG)
-            self.send_json({"success": True})
-            return
-
-        # Task execution
-        if path.startswith('/api/task/') and path.endswith('/run'):
-            task_id = path.split('/')[3]
-            result = run_task(task_id)
-            self.send_json(result)
-            return
-
-        # File operations: /api/device/{id}/files
-        if path.startswith('/api/device/') and path.endswith('/files'):
-            parts = path.split('/')
-            dev_id = parts[3]
-            dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
-
-            if not dev:
-                self.send_json({"success": False, "error": "Device not found"}, 404)
-                return
-
-            length = int(self.headers.get('Content-Length', 0))
-            data = json.loads(self.rfile.read(length))
-            operation = data.get('operation')
-            paths = data.get('paths', [])
-
-            if operation in ('copy', 'move'):
-                dest_dev_id = data.get('dest_device')
-                dest_path = data.get('dest_path')
-                dest_dev = next((d for d in CONFIG['devices'] if d['id'] == dest_dev_id), None)
-                if not dest_dev:
-                    self.send_json({"success": False, "error": "Destination device not found"}, 404)
-                    return
-                result = file_operation(dev, operation, paths, dest_device=dest_dev, dest_path=dest_path)
-            elif operation == 'rename':
-                new_name = data.get('new_name')
-                result = file_operation(dev, operation, paths, new_name=new_name)
-            elif operation == 'mkdir':
-                new_name = data.get('new_name')
-                result = file_operation(dev, operation, paths, new_name=new_name)
-            elif operation in ('delete', 'zip'):
-                result = file_operation(dev, operation, paths)
-            else:
-                result = {"success": False, "error": f"Unknown operation: {operation}"}
-
-            self.send_json(result)
-            return
-
-        # File upload: /api/device/{id}/upload?path=/dest/folder
-        if path.startswith('/api/device/') and '/upload' in path:
-            parts = path.split('/')
-            dev_id = parts[3]
-            dev = next((d for d in CONFIG['devices'] if d['id'] == dev_id), None)
-
-            if not dev:
-                self.send_json({"success": False, "error": "Device not found"}, 404)
-                return
-
-            parsed = urlparse(self.path)
-            query = parse_qs(parsed.query)
-            dest_path = query.get('path', ['/'])[0]
-
-            # Parse multipart form data
-            content_type = self.headers.get('Content-Type', '')
-            if 'multipart/form-data' not in content_type:
-                self.send_json({"success": False, "error": "Expected multipart/form-data"}, 400)
-                return
-
-            # Extract boundary
-            boundary = None
-            for part in content_type.split(';'):
-                part = part.strip()
-                if part.startswith('boundary='):
-                    boundary = part[9:].strip('"')
-                    break
-
-            if not boundary:
-                self.send_json({"success": False, "error": "No boundary in multipart"}, 400)
-                return
-
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length)
-
-            # Parse multipart - simple parser for single file
-            boundary_bytes = ('--' + boundary).encode()
-            parts = body.split(boundary_bytes)
-
-            uploaded = 0
-            errors = []
-
-            for part in parts:
-                if b'Content-Disposition: form-data;' not in part:
-                    continue
-                if b'filename="' not in part:
-                    continue
-
-                # Extract filename
-                header_end = part.find(b'\r\n\r\n')
-                if header_end == -1:
-                    continue
-                header = part[:header_end].decode('utf-8', errors='ignore')
-                content = part[header_end + 4:]
-
-                # Remove trailing \r\n--
-                if content.endswith(b'\r\n'):
-                    content = content[:-2]
-                if content.endswith(b'--'):
-                    content = content[:-2]
-                if content.endswith(b'\r\n'):
-                    content = content[:-2]
-
-                # Get filename from header
-                import re
-                match = re.search(r'filename="([^"]+)"', header)
-                if not match:
-                    continue
-                filename = match.group(1)
-
-                # Upload file
-                result = upload_file(dev, dest_path, filename, content)
-                if result['success']:
-                    uploaded += 1
-                else:
-                    errors.append(f"{filename}: {result['error']}")
-
-            if errors:
-                self.send_json({"success": False, "error": "; ".join(errors), "uploaded": uploaded})
-            else:
-                self.send_json({"success": True, "uploaded": uploaded})
-            return
-
-        self.send_json({"success": False, "error": "Not found"}, 404)
-
-
-def main():
-    parser = argparse.ArgumentParser(description='DeQ - Homelab Dashboard')
-    parser.add_argument('--port', type=int, default=DEFAULT_PORT, help=f'Port to run on (default: {DEFAULT_PORT})')
-    args = parser.parse_args()
-
-    port = args.port
-
-    print(f"""
-================================================================
-              DeQ - Homelab Dashboard
-================================================================
-  Version: {VERSION}
-  Port:    {port}
-
-  Access URL:
-  http://YOUR-IP:{port}/
-================================================================
-    """)
-    
-    # Start task scheduler
-    task_scheduler.start()
-
-    server = HTTPServer(('0.0.0.0', port), RequestHandler)
-    print(f"Server running on port {port}...")
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-        task_scheduler.stop()
-        server.shutdown()
-
 
 if __name__ == '__main__':
     main()

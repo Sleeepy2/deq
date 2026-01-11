@@ -1,278 +1,208 @@
 # DeQ
-<p align="center">Rethinking homelab tools. Less complexity, more control.<p align="center"></p>
 
-<p align="center">A bare-metal homelab admin deck with root access and Android monitoring app. Small enough to live alongside Pi-hole on a Pi Zero. Capable enough to control your entire network. Get notifications on your smartphone when things go wrong.</p>
+<p align="center"><strong>Your homelab under control. From anywhere.</strong></p>
 
-![DeQ Hero](assets/DeQ-Hero.jpg)
+<p align="center">
+A single Python file providing SSH-based control via a web interface,
+connected to a native Android app, Wear OS, and Android Auto.
+<br><br>
+<strong>Zero dependencies. Dynamic config. No YAML.</strong>
+</p>
 
-**Website:** [deq.rocks](https://deq.rocks) · **Support:** [Patreon](https://patreon.com/deqrocks)
+![DeQ Hero](assets/DeQ-Hero-ambient.jpg)
 
-## Concept
+<p align="center">
+<a href="https://deq.rocks">Website</a> ·
+<a href="https://deq.rocks/documentation.html">Documentation</a> ·
+<a href="https://deq.rocks/faq.html">FAQ</a> ·
+<a href="https://deq.rocks/press.html">Press Kit</a> ·
+<a href="https://patreon.com/deqrocks">Patreon</a>
+</p>
 
-**DeQ runs bare metal, not in Docker.**
+## Table of Contents
 
-It's designed for low-power devices that are already online 24/7 - a Pi, a mini PC, even a WRT router. These give you always-on access to your homelab via Tailscale or LAN, without the overhead of a full server.
-Docker would add overhead and break core features: Wake-on-LAN needs raw sockets, the file manager needs your filesystem, SSH and rsync run as host processes, and shutdown commands don't work from inside a container.
-DeQ bridges monitoring and control - with a minimal footprint as its core principle. One file, focused scope, no bloat.
-
-**This comes with responsibility.**
-
-DeQ runs as root and has direct access to your system. That's what makes features like WOL, file transfers, and remote shutdown possible - but it also means you should never expose it to the public internet.
-
-- Use Tailscale, Wireguard or another VPN for remote access
-- Only run DeQ on trusted networks
+- [Features](#features)
+- [Concept](#concept)
+  - [Ambitions](#ambitions)
+  - [Architecture](#architecture)
+  - [Connectivity](#connectivity)
+- [Free Android App](#free-android-app)
+- [Paid Android Pro App](#paid-android-pro-app)
+- [Installation](#installation)
+- [Screenshots](#screenshots)
+- [License](#license)
+- [Credits](#credits)
+<br><br>
 
 ## Features
 
-- **Android Companion app** - free app for your smartphone to manage your servers or get notified when things go wrong
-- **Device Control** - Wake-on-LAN, shutdown, Docker start/stop
-- **Scheduled Tasks** - Automated backups, wake and shutdown
-- **File Manager** - Dual-pane file browser, copy/move/upload between devices
-- **System Stats** - CPU, RAM, temperature, disk usage
-- **Quick Links** - Bookmarks to your services with custom icons (Lucide or Dashboard Icons)
-- **Theming** - Custom colors, wallpapers, and transparency/blur effects
-- **PWA Support** - Install as web app on any desktop or smartphone
+- **Onboarding** – Automatic device and container discovery
+discovery
+- **Native Android App** - Background monitoring, push notifications, widgets, Android Auto, Wear OS
+- **Device Control** - Wake-on-LAN, shutdown, suspend, Docker start/stop
+- **Device Monitoring** - CPU load, temp, SMART... with alarm thresholds
+- **File Manager** - Dual-pane browser, copy/move/upload between devices
+- **Scheduled Tasks** - Wizard guided automated backups, wake, shutdown, and scripts
+- **Theming** - Custom colors, wallpapers, transparency effects
+- **Quick Stuff** - Bookmark and script runner buttons with support for Lucide, Dash...
+- **PWA Support** - Install as app on any device
+- **Admin Auth** - Adds an additional security layer
+<br><br>
+
+
+## Concept
+
+### Ambitions
+
+- Less, but better. Lateral thinking over complexity.
+- Use what’s there. Move fast. Make it useful.
+
+DeQ is an ultra-lightweight network control layer that exposes the raw power of SSH on mobile devices — without unnecessary abstraction.
+<br><br>
+
+### Architecture
+
+At the core of DeQ is a single Python file: `server.py`.
+It lives on your server and acts as the entire control layer.
+
+What makes it powerful — yet lightweight — is its restraint.
+DeQ is essentially SSH commands wrapped in a thin, vanilla Python shell.
+There are no dependencies beyond Linux and Python.
+The same file serves a dashboard-like web interface.
+It is mobile-first, responsive, and accessible from any browser.
+
+We deliberately restrict `server.py` to a maximum size of 500 KB.
+It currently sits at around 350 KB.
+A typical fresh installation, managing a few devices, containers, and tasks,
+uses roughly 20 MB of RAM and virtually no CPU.
+<br><br>
+
+### Connectivity
+
+The native Android app, Android Auto, and Wear OS sync directly with `server.py`.
+The server, in turn, connects to your host and other network devices via SSH.
+
+DeQ is not a dashboard. DeQ is a control layer disguised as a dashboard.
+It is a well-connected control layer with access to core homelab functions
+such as Wake-on-LAN, task scheduling, and file management —
+as well as sensors and context from your mobile devices.
+
+For example, the Android app can automatically put selected containers or servers
+to sleep when you plug in your phone at night —
+and wake them again when you unplug it in the morning.
+
+![DeQ Connectivity](assets/DeQ-connectivity.svg)
+---
+## Free Android App
+<p align="center">
+<img src="assets/DeQ-notifications.jpg" width="280">
+<img src="assets/DeQ-webview.jpg" width="280">
+</p>
+<p align="center"><em>Push notifications · Full web interface</em></p>
+
+Native companion app with background monitoring and push notifications when devices go offline, containers stop, or backups fail. **Ad-Free**
+
+<p align="center">
+<a href="https://play.google.com/store/apps/details?id=com.deq.app"><img src="https://img.shields.io/badge/Free-Google_Play-2ed573?style=for-the-badge&logo=google-play" alt="DeQ Free on Google Play"></a>
+<a href="https://github.com/deqrocks/deq/releases"><img src="https://img.shields.io/badge/Free-GitHub_Releases-2ed573?style=for-the-badge&logo=github" alt="Free APK on GitHub"></a>
+</p>
+
+## Paid Android Pro App
+<p align="center"><img src="assets/DeQ-ambient.jpg" width="300"></p>
+<p align="center"><em>Ambient Mode with BCD clock</em></p>
+
+**DeQ Pro** adds powerful automation and visualization features. Your purchase keeps this project alive as a full-time effort.
+
+
+<table align="center">
+  <thead>
+    <tr>
+      <th>Feature</th>
+      <th>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Widgets</strong></td>
+      <td>5 widget styles for home and lock screen</td>
+    </tr>
+    <tr>
+      <td><strong>Live Wallpaper</strong></td>
+      <td>Animated status display as background</td>
+    </tr>
+    <tr>
+      <td><strong>Ambient Mode</strong></td>
+      <td>Wall-mount display with BCD clock, OLED optimized</td>
+    </tr>
+    <tr>
+      <td><strong>Android Auto</strong></td>
+      <td>Homelab status in your car</td>
+    </tr>
+    <tr>
+      <td><strong>Wear OS</strong></td>
+      <td>Watch app, tile, and complications</td>
+    </tr>
+    <tr>
+      <td><strong>Sleep With Me</strong></td>
+      <td>Homelab sleeps when you sleep</td>
+    </tr>
+  </tbody>
+</table>
+<br>
+
+
+<p align="center">
+<img src="assets/DeQ-sleep-with-me-plug-in.jpg" width="280">
+<img src="assets/DeQ-sleep-with-me-unplug.jpg" width="280">
+</p>
+<p align="center"><em>Sleep With Me: Plug in to sleep · Unplug to wake</em></p>
+
+<p align="center">
+<img src="assets/DeQ-android-auto.png" width="560">
+</p>
+<p align="center"><em>Android Auto integration</em></p>
+
+<p align="center">
+<img src="assets/DeQ-wear-os.jpg" width="280">
+<img src="assets/DeQ-wear-os-tile.jpg" width="280">
+</p>
+<p align="center"><em>Wear OS app · Quick tile</em></p>
+<p align="center">
+<a href="https://play.google.com/store/apps/details?id=com.deq.app.pro"><img src="https://img.shields.io/badge/Pro_(€6.99)-Google_Play-2ed573?style=for-the-badge&logo=google-play" alt="DeQ Pro on Google Play"></a>
+</p>
 
 ## Installation
 
 ```bash
-wget https://github.com/deqrocks/deq/releases/download/stable/deq.zip
+wget https://github.com/deqrocks/deq/releases/latest/download/deq.zip
 unzip deq.zip -d deq && cd deq
 sudo ./install.sh
 ```
 
-The installer asks a few questions (IP, port) and gives you your access URL.
+The installer asks a few questions and gives you your access URL.
 
-## Getting Started
+**Full setup guide:** [deq.rocks/documentation](https://deq.rocks/documentation.html)
+
+## Screenshots
+
 <p align="center"><img src="assets/DeQ-Onboarding-Devices.jpg" width="700"></p>
+<p align="center"><em>User onboarding wizard</em></p>
 
-1. Open your DeQ URL in a browser (like 192.168.1.1:5050)
-2. Follow the onboarding dialog to scan your network for devices and containers
-3. Click the pencil icon to edit existing items or to add devices manually
-4. Add links and notes - assign icons
-5. Drag links or devices to reorder them
-6. Click the layout button (eco/1/4/2/4/4/4) to change link arrangement
-7. Click the eye icon to hide sections you don't need
-8. Click the palette icon to toggle monochrome icons
-9. Scroll down to the Theme section to customize colors and wallpaper
-
-The server running DeQ is automatically added as the "Host" device with local stats.
-
-## Icons
-
-Links and devices support three icon sources:
-
-| Format | Example | Description |
-|--------|---------|-------------|
-| Lucide | `server` | Default. See [lucide.dev/icons](https://lucide.dev/icons) |
-| Dashboard Icons | `dash:proxmox` | Self-hosted app icons. See [dashboardicons.com](https://dashboardicons.com) |
-| Custom URL | `https://...` | Any image URL |
-
-In edit mode, click the palette icon next to "Links" to toggle monochrome mode for all icons.
-
-## Adding Devices
-<p align="center"><img src="assets/DeQ-Device-Features.jpg" width="700"></p>
-
-**Manually**
-
-You can manually add devices by activating the edit mode > go to the devices section > click "+".
-After you added the device you can manually add containers or scan for containers running on that device.
-
-**Using the Wizard**
-
-You can automatically add devices and containers by using the wizard: activate edit mode > go to the devices section > click "scan". Add your devices and SSH user name. Next step it will scan for Docker containers. Make sure to have ssh keypairs exchanged for that to work.
-
-Each device can have:
-
-| Feature | What it does |
-|---------|--------------|
-| **Wake-on-LAN** | Power on the device remotely |
-| **Quick Connect** | Buttons for RDP, VNC, or web interfaces |
-| **Docker** | Scan for containers or add manually, start/stop, optional RDP/VNC/Web buttons |
-| **SSH** | Enables stats and shutdown for remote devices |
-
-
-### Understanding IP addresses
-
-DeQ uses different IPs for different purposes:
-
-- **Local IP** (device settings): Always your LAN IP (192.168.x.x). Used by the DeQ server for Wake-on-LAN, SSH connections, and ping checks.
-
-- **Quick Connect / Docker IPs**: These are for your browser/phone to connect. Use LAN IPs when at home, or Tailscale IPs when accessing remotely.
-
-**Example with Tailscale:**
-- Device Local IP: `192.168.1.100` (for WOL/SSH)
-- Docker VNC: `100.x.x.x:8006` (Tailscale IP, so VNC works from anywhere)
-
-### Connecting via SSH (optional)
-
-To see stats or shutdown remote devices, DeQ needs SSH access. This is optional - devices without SSH still work for Wake-on-LAN and links.
-
-**Quick setup:**
-```bash
-# Generate a key (skip if you already have one)
-ssh-keygen -t ed25519
-
-# Copy it to your device
-ssh-copy-id user@device-ip
-
-# DeQ runs as root, so copy the key there too
-sudo cp ~/.ssh/id_ed25519* /root/.ssh/
-sudo chmod 600 /root/.ssh/id_ed25519
-
-# Test it
-sudo ssh user@device-ip 'echo OK'
-```
-
-## Remote Access
-
-DeQ has no built-in authentication. For secure remote access, use [Tailscale](https://tailscale.com) or another VPN. Access DeQ via your Tailscale IP.
-
-## Scheduled Tasks
-<p align="center"><img src="assets/DeQ-Task-Wizard.jpg" width="700"></p>
-
-DeQ can run tasks automatically:
-
-- **Wake** - Power on a device or start a Docker container
-- **Shutdown** - Power off a device or stop a Docker container
-- **Backup** - Sync files between devices using rsync
-
-Example workflow: Wake your NAS at 3 AM, run a backup from your main server, shut it down when done.
-
-## File Manager
 <p align="center"><img src="assets/DeQ-File-Manager.jpg" width="700"></p>
+<p align="center"><em>Dual-pane file manager (desktop)</em></p>
 
-Click the folder icon (top right) to open the dual-pane file manager. Browse files on any device with SSH configured. File Manager will also work on your smartphone. BE CAREFUL with what you're doing in the root folder!
+<p align="center"><img src="assets/app-free-filemanager.jpg" width="280"></p>
+<p align="center"><em>Dual-pane file manager (phone)</em></p>
 
-**Features:**
-- Copy and move files between devices
-- Upload files (button or drag & drop)
-- Delete files
-- Create new Folders
-- Create zip archives (or tar.gz as fallback)
-- Download individual files
+<p align="center"><img src="assets/DeQ-Task-Wizard.jpg" width="700"></p>
+<p align="center"><em>Task scheduler</em></p>
 
-**Navigation:**
-- Click to select (single pane only)
-- Double-click to open folders
-- Drag files from your desktop to upload
-
-## Theming
-
-In edit mode, scroll down to the Theme section to customize the look:
-
-| Setting | Description |
-|---------|-------------|
-| **Colors** | Background, cards, borders, text, accent color |
-| **Transparency** | Transparency effect for cards (0-100%) |
-| **Blur** | Background blur amount (0-30px) |
-| **Wallpaper** | Background image URL (https://...) |
-
-Click "Reset to Defaults" to restore the original dark theme.
-
-## Mobile App
-
-Control your homelab from your phone - check stats, wake devices, manage containers.
-
-### Android
-
-Native Android apps for DeQ - faster startup, background notifications, no browser needed.
-
-**Download:** Free app from the releases on github, Pro app coming soon on Playstore**
-
-#### Free vs Pro
-
-| Feature | DeQ (Free) | DeQ Pro (€4.99) |
-|---------|------------|-----------------|
-| WebView Dashboard | ✓ | ✓ |
-| Background Polling | 30 min | custom |
-| Push Notifications | ✓ | ✓ |
-| Android Auto | ✗ | ✓ |
-
-**Why a paid version?**
-
-Unlike Patreon tiers with "exclusive updates" or "Discord access", the paid app offers real features that take real work to build:
-
-- **Custom Polling**: Set your own interval - from seconds to hours
-- **Android Auto**: Check your homelab status from your car's dashboard
-
-Your support keeps this project alive as a full-time effort.
-
-### iOS
-
-Install DeQ as a PWA: Safari → Share → Add to Home Screen. Works like a native app.
-Native iOS app planned when funding allows.
-
-## Desktop App
 <p align="center"><img src="assets/DeQ-PWA-Desktop.jpg" width="700"></p>
-
-Install DeQ as a desktop app - no more hunting through browser tabs. One click in your dock or taskbar, and you're in.
-
-**Why install as an app?**
-- Clean window without browser UI
-- Lives in your dock/taskbar - always one click away
-- No tabs to dig through
-- Same interface, instant access
-
-**How to install:**
-
-| Platform | Steps |
-|----------|-------|
-| **macOS (Safari)** | File → Add to Dock |
-| **macOS (Chrome)** | Menu (⋮) → "Cast, save, and share" → "Install page as app..." |
-| **Windows (Edge)** | Menu (···) → Apps → "Install this site as an app" |
-| **Windows (Chrome)** | Menu (⋮) → "Cast, save, and share" → "Install page as app..." |
-| **Linux** | Chrome → Menu (⋮) → "Cast, save, and share" → "Install page as app..." |
-
-Once installed, DeQ opens in its own window and lives in your dock.
-
-## Service Commands
-
-```bash
-sudo systemctl status deq     # Check status
-sudo systemctl restart deq    # Restart
-sudo journalctl -u deq -f     # View logs
-```
-
-## Data Storage
-
-All data is stored in `/opt/deq/config.json`. To backup: just copy `config.json`. To restore: copy it back and restart.
-
-## Updating
-
-To update DeQ, download the latest release and run the installer again:
-
-```bash
-wget https://github.com/deqrocks/deq/releases/download/stable/deq.zip
-unzip deq.zip -d deq && cd deq
-sudo ./install.sh
-```
-
-Your `config.json` is preserved - the installer only overwrites `server.py`.
-
-## Uninstall
-
-```bash
-sudo systemctl stop deq
-sudo systemctl disable deq
-sudo rm /etc/systemd/system/deq.service
-sudo rm -rf /opt/deq
-sudo systemctl daemon-reload
-```
-
-Or as single command
-
-```bash
-sudo systemctl stop deq && sudo systemctl disable deq && sudo rm /etc/systemd/system/deq.service && sudo rm -rf /opt/deq && sudo systemctl daemon-reload
-```
-
-## Disclaimer
-
-DeQ is provided "as is" without warranty. The authors are not liable for any damages resulting from its use. By installing DeQ, you accept full responsibility for securing your system. See [LICENSE](LICENSE) for details.
+<p align="center"><em>Desktop PWA</em></p>
 
 ## License
 
-CC BY-NC 4.0 - Free for personal use, no commercial use without permission. See [LICENSE](LICENSE).
+CC BY-NC 4.0 - Free for personal use, no commercial use without permission.
 
 ## Credits
 
