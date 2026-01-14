@@ -1,10 +1,13 @@
 # /opt/deq/extensions/deq-ressource-usage.py
+# ------------------------------------------------------------------------------
+# Name:        deq-ressource-usage.py
+# Author:      deqrocks
+# Tested on:   Ubuntu 24.04
+# Requirements: DeQ only
+# Description:
 #
-# --- DESCRIPTION ---
-#
-# DeQ Resource Usage Monitor Extension
-#
-# This uses DeQ's extension API: https://deq.rocks/documentation.html#extension-api
+# This is a DeQ Resource Usage Monitor Extension.
+# It uses DeQ's extension API: https://deq.rocks/documentation.html#extension-api
 # It displays real-time resource usage of the DeQ server process for debugging including:
 # - RAM consumption (MB) with growth delta since startup
 # - CPU load (%) calculated via interval-based measurement
@@ -26,6 +29,7 @@
 # - 30 seconds = 6 hours of history (default, recommended for debugging memory leaks)
 # - 60 seconds = 12 hours of history (for long-term monitoring)
 # - 10 seconds = 2 hours of history (for detailed analysis)
+# ------------------------------------------------------------------------------
 
 import os
 import time
@@ -34,8 +38,8 @@ import threading
 START_TIME = time.time()
 START_RAM = 0
 HISTORY = []
-MAX_HISTORY = 720  # 6 hours (720 * 30s)
-LOG_INTERVAL = 30 # seconds 
+MAX_HISTORY = 720  # 6 hour graph (720 * 30s)
+LOG_INTERVAL = 30 # 30 seconds polling interval 
 HISTORY_LOCK = threading.Lock()
 
 # Helper variables for interval-based CPU calculation
